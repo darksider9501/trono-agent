@@ -46,8 +46,10 @@ function log(msg, data) {
 }
 
 function randomId() {
-  const h = () => Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, '0');
-  return `${h()}-${h()}-${h()}-${h()}`;
+  // The claim endpoints validate request_id as a UUID v4. The site client uses
+  // crypto.randomUUID(); a hand-rolled hex id is rejected with
+  // HTTP 409 "Solicitud inválida." before any reward is granted.
+  return require('crypto').randomUUID();
 }
 
 /** Daily login reward: POST /api/daily_rewards.php {action:'claim', request_id} */
@@ -57,7 +59,11 @@ async function claimDailyLogin(g) {
   if (!cfg.data || !cfg.data.available) {
     return { done: false, reason: `not available yet (${cfg.data ? cfg.data.remaining_seconds : '?'}s)` };
   }
-  const csrf = await g.csrfFor('/pages/quests_main.php');
+  // The claim endpoint issues its own CSRF inside the GET payload (data.csrf);
+  // the site client echoes exactly that token. A token scraped from
+  // /pages/quests_main.php is rejected by this endpoint.
+  const csrf = cfg.data && cfg.data.csrf;
+  if (!csrf) return { done: false, reason: 'daily_rewards gave no csrf' };
   const res = await g.apiPost('/api/daily_rewards.php', { action: 'claim', request_id: randomId() }, {
     allowMutate: LIVE,
     csrf
