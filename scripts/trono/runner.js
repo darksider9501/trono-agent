@@ -46,9 +46,10 @@ function log(msg, data) {
 }
 
 function randomId() {
-  // The claim endpoints validate request_id as a UUID v4. The site client uses
-  // crypto.randomUUID(); a hand-rolled hex id is rejected with
-  // HTTP 409 "Solicitud inválida." before any reward is granted.
+  // /api/daily_rewards.php validates request_id as a UUID v4, matching
+  // crypto.randomUUID() in /assets/js/daily-rewards.js?v=5. A hand-rolled hex id
+  // is rejected with 409 "Solicitud inválida." before any reward is granted.
+  // /api/daily_production.php takes no request_id at all.
   return require('crypto').randomUUID();
 }
 
@@ -61,8 +62,8 @@ async function claimDailyLogin(g) {
   }
   // The claim endpoint issues its own CSRF inside the GET payload (data.csrf);
   // the site client echoes exactly that token. A token scraped from
-  // /pages/quests_main.php is rejected by this endpoint.
-  const csrf = cfg.data && cfg.data.csrf;
+  // /pages/quests_main.php is rejected with "CSRF inválido".
+  const csrf = cfg.data.csrf;
   if (!csrf) return { done: false, reason: 'daily_rewards gave no csrf' };
   const res = await g.apiPost('/api/daily_rewards.php', { action: 'claim', request_id: randomId() }, {
     allowMutate: LIVE,
@@ -71,19 +72,33 @@ async function claimDailyLogin(g) {
   return { done: !!(res && res.ok), reason: (res && (res.message || 'claimed')) || 'no response' };
 }
 
-/** Kingdom production claim. */
+/** Kingdom production claim. The site embeds this endpoint's CSRF only in the
+ *  overview production card, not on /pages/economy.php. */
 async function claimProduction(g) {
   const dp = await g.apiGet('/api/daily_production.php');
   if (!dp || !dp.ok) return { done: false, reason: 'production unreadable' };
   if (!dp.data || !dp.data.claim_available) {
     return { done: false, reason: `nothing to claim (${dp.data ? dp.data.seconds_to_next : '?'}s)` };
   }
-  const csrf = await g.csrfFor('/pages/economy.php');
-  const res = await g.apiPost('/api/daily_production.php', { action: 'claim', request_id: randomId() }, {
-    allowMutate: LIVE,
-    csrf
-  });
-  return { done: !!(res && res.ok), reason: (res && (res.message || 'claimed')) || 'no response' };
+  try {
+    // csrfFor('/pages/economy.php') returned the first csrf on that page, which
+    // belongs to building_notices.php: economy.html never mentions this
+    // endpoint. The overview card carries the token that matches it.
+    const page = await g.fetchPage('/pages/overview.php');
+    if (!page.ok) return { done: false, reason: `overview HTTP ${page.status}` };
+    const m = /data-production-card[^>]*data-api="\/api\/daily_production\.php"[^>]*data-csrf="([0-9a-f]{64})"/i.exec(
+      page.html
+    );
+    if (!m) return { done: false, reason: 'no production csrf on overview' };
+    // The site controller posts {action:'claim'} and no request_id here.
+    const res = await g.apiPost('/api/daily_production.php', { action: 'claim' }, {
+      allowMutate: LIVE,
+      csrf: m[1]
+    });
+    return { done: !!(res && res.ok), reason: (res && (res.message || 'claimed')) || 'no response' };
+  } catch (e) {
+    return { done: false, reason: e.message };
+  }
 }
 
 /** Activity milestones are claimed through the quests page form (16-hex csrf). */

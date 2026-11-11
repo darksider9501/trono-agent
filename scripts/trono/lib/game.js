@@ -175,7 +175,7 @@ class Game {
 
   async apiGet(apiPath) {
     const r = await this.evalInPage(`(async () => {
-      const r = await fetch(${JSON.stringify(apiPath)}, { credentials: 'same-origin', headers: { Accept: 'application/json' } });
+      const r = await fetch(${JSON.stringify(apiPath)}, { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' } });
       const t = await r.text();
       let j = null; try { j = JSON.parse(t); } catch (e) {}
       return { status: r.status, json: j, raw: j ? null : t.slice(0, 400) };
