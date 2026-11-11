@@ -1,0 +1,436 @@
+/**
+ * Autonomous runner for Defiende el Trono — v2 (plays the game).
+ *
+ * Loop, in priority order:
+ *   1. keep the session alive (idle timeout is 180 s of untrusted input)
+ *   2. claim everything that is free (daily login, production, activity milestones)
+ *   3. spend points the game has granted (attributes, skill ranks)
+ *   4. fight the best EXP-per-HP target the hero can actually beat
+ *   5. when HP is too low to fight, rest at the hospital and wait
+ *
+ * Hard safety rules:
+ *   - never start a fight the predictor says is a loss (HP is the scarce resource)
+ *   - never spend gold, gems, diamonds or Dotiria
+ *
+ * Usage:
+ *   node scripts/trono/runner.js --dry
+ *   node scripts/trono/runner.js --live
+ *   node scripts/trono/runner.js --live --loop=120
+ *   node scripts/trono/runner.js --live --fights=3    # cap fights per tick
+ */
+const fs = require('fs');
+const path = require('path');
+const { Game, sleep } = require('./lib/game');
+const { readHero, rankTargets, fight, combatCsrf, abandonCombat, ENCOUNTERS } = require('./lib/combat');
+const dailies = require('./lib/dailies');
+const talents = require('./lib/talents');
+
+const args = process.argv.slice(2);
+const LIVE = args.includes('--live');
+const loopArg = args.find((a) => a.startsWith('--loop='));
+const loopSeconds = loopArg ? parseInt(loopArg.split('=')[1], 10) : 0;
+const fightsArg = args.find((a) => a.startsWith('--fights='));
+const maxFights = fightsArg ? parseInt(fightsArg.split('=')[1], 10) : 2;
+
+const LOG_DIR = path.join(__dirname, 'logs');
+const LOG = path.join(LOG_DIR, 'runner.log');
+
+function log(msg, data) {
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  const line = `[${new Date().toISOString()}] ${msg}${data ? ' ' + JSON.stringify(data) : ''}`;
+  console.log(line);
+  try {
+    if (fs.existsSync(LOG) && fs.statSync(LOG).size > 1024 * 1024) fs.renameSync(LOG, LOG + '.1');
+    fs.appendFileSync(LOG, line + '\n', 'utf8');
+  } catch (e) {}
+}
+
+function randomId() {
+  const h = () => Math.floor(Math.random() * 0x100000000).toString(16).padStart(8, '0');
+  return `${h()}-${h()}-${h()}-${h()}`;
+}
+
+/** Daily login reward: POST /api/daily_rewards.php {action:'claim', request_id} */
+async function claimDailyLogin(g) {
+  const cfg = await g.apiGet('/api/daily_rewards.php');
+  if (!cfg || !cfg.ok) return { done: false, reason: 'daily_rewards unreadable' };
+  if (!cfg.data || !cfg.data.available) {
+    return { done: false, reason: `not available yet (${cfg.data ? cfg.data.remaining_seconds : '?'}s)` };
+  }
+  const csrf = await g.csrfFor('/pages/quests_main.php');
+  const res = await g.apiPost('/api/daily_rewards.php', { action: 'claim', request_id: randomId() }, {
+    allowMutate: LIVE,
+    csrf
+  });
+  return { done: !!(res && res.ok), reason: (res && (res.message || 'claimed')) || 'no response' };
+}
+
+/** Kingdom production claim. */
+async function claimProduction(g) {
+  const dp = await g.apiGet('/api/daily_production.php');
+  if (!dp || !dp.ok) return { done: false, reason: 'production unreadable' };
+  if (!dp.data || !dp.data.claim_available) {
+    return { done: false, reason: `nothing to claim (${dp.data ? dp.data.seconds_to_next : '?'}s)` };
+  }
+  const csrf = await g.csrfFor('/pages/economy.php');
+  const res = await g.apiPost('/api/daily_production.php', { action: 'claim', request_id: randomId() }, {
+    allowMutate: LIVE,
+    csrf
+  });
+  return { done: !!(res && res.ok), reason: (res && (res.message || 'claimed')) || 'no response' };
+}
+
+/** Activity milestones are claimed through the quests page form (16-hex csrf). */
+async function claimActivity(g, milestones) {
+  const page = await g.fetchPage('/pages/quests_main.php');
+  if (!page.ok) return { done: false, reason: `quests page HTTP ${page.status}` };
+  const csrf16 = /name="csrf" value="([0-9a-f]{16,})"/i.exec(page.html);
+  if (!csrf16) return { done: false, reason: 'no 16-hex csrf on quests page' };
+
+  const claimed = [];
+  for (const m of milestones) {
+    const res = await g.postForm(
+      '/pages/quests_main.php',
+      { csrf: csrf16[1], quest_action: 'claim_activity', milestone: String(m) },
+      { allowMutate: LIVE }
+    );
+    claimed.push({ milestone: m, status: res && res.status });
+  }
+  return { done: claimed.length > 0, reason: `milestones ${milestones.join(',')}`, claimed };
+}
+
+async function activityProgress(g) {
+  const page = await g.fetchPage('/pages/quests_main.php');
+  const m = page.text.match(/ACTIVIDAD DIARIA\s*(\d+)\s*\/\s*(\d+)/i) || page.html.match(/(\d+)\s*\/\s*100/);
+  if (!m) return null;
+  return { current: parseInt(m[1], 10), max: parseInt(m[2] || '100', 10) };
+}
+
+/**
+ * Spend attribute points where the predictor says they buy the most progress:
+ * the allocation that maximises EXP per HP on the current best target.
+ */
+async function spendAttributePoints(g, hero, targets) {
+  const available = await g.apiGet('/api/hero_attributes.php');
+  let points = (available && available.data && available.data.points_available) || 0;
+  if (points <= 0) return { done: false, reason: 'no points' };
+
+  const applied = [];
+  while (points > 0) {
+    const best = targets.find((t) => t.win) || targets[0];
+    const score = {};
+    for (const attr of ['vitality', 'strength']) {
+      const probe = {
+        ...hero,
+        maxHp: hero.maxHp + (attr === 'vitality' ? 10 : 0),
+        armor: hero.armor + (attr === 'vitality' ? 1 : 0),
+        atkDmg: hero.atkDmg + (attr === 'strength' ? 2 : 0)
+      };
+      const sim = rankTargets(probe).find((t) => t.key === best.key);
+      score[attr] = sim && sim.win ? sim.expPerHp : 0;
+    }
+    const chosen = score.vitality >= score.strength ? 'vitality' : 'strength';
+
+    const page = await g.fetchPage('/pages/overview.php');
+    const m = /data-api="\/api\/hero_attributes.php" data-csrf="([0-9a-f]{64})"/.exec(page.html) ||
+      /data-overview-attributes[\s\S]{0,400}?data-csrf="([0-9a-f]{64})"/.exec(page.html);
+    if (!m) return { done: applied.length > 0, reason: 'no attribute csrf', applied };
+
+    const res = await g.apiPost('/api/hero_attributes.php', { attribute: chosen }, {
+      allowMutate: LIVE,
+      csrf: m[1]
+    });
+    if (!res || !res.ok) return { done: applied.length > 0, reason: (res && res.message) || 'post failed', applied };
+    applied.push(chosen);
+    if (chosen === 'vitality') {
+      hero.maxHp += 10;
+      hero.armor += 1;
+    } else {
+      hero.atkDmg += 2;
+    }
+    points = res.data ? res.data.points_available : points - 1;
+  }
+  return { done: true, reason: `applied ${applied.join(', ')}`, applied };
+}
+
+/** Skill points: keep upgrading the primary damage skill. */
+async function spendSkillPoints(g, hero) {
+  if (!hero.skillPoints) return { done: false, reason: 'no skill points' };
+  const key = hero.skill ? hero.skill.key : 'wildfire_bolt';
+  const page = await g.fetchPage('/pages/skills.php');
+  const m = /data-skills-page[\s\S]{0,300}?data-csrf="([0-9a-f]+)"/.exec(page.html);
+  if (!m) return { done: false, reason: 'no skills csrf' };
+  const res = await g.apiPost('/api/hero_skill_upgrade.php', { skill_key: key }, {
+    allowMutate: LIVE,
+    csrf: m[1]
+  });
+  return { done: !!(res && res.ok), reason: res && res.ok ? `${key} upgraded` : (res && res.message) || 'failed' };
+}
+
+/** Rest at the hospital for the +0.5%/min HP bonus while waiting. */
+async function restAtHospital(g) {
+  if (!LIVE) return { done: false, reason: 'dry run' };
+  // Re-posting "rest" every tick resets the recovery timer and silently cancels the
+  // whole bonus, so only start resting when the hero is not already resting.
+  const ps = await g.apiGet('/api/player_state.php');
+  const resting = ps && ps.ok && ps.state.hero.vitals.resting_building;
+  if (resting === 'hospital') return { done: false, reason: 'already resting' };
+
+  const page = await g.fetchPage('/pages/buildings.php?view=hospital');
+  const csrf = /name="csrf" value="([0-9a-f]+)"/.exec(page.html);
+  if (!csrf) return { done: false, reason: 'no hospital csrf' };
+  const res = await g.postForm(
+    '/pages/buildings.php?view=hospital',
+    { building_key: 'hospital', csrf: csrf[1], action: 'rest' },
+    { allowMutate: LIVE }
+  );
+  return { done: (res && res.status) === 200, reason: 'resting at hospital' };
+}
+
+/** Daily quests: accept what combat can finish, then claim whatever is ready. */
+async function handleDailies(g) {
+  let accepted = [];
+  try {
+    const o = await dailies.offers(g);
+    // Skip offers that require spending gold/materials or crafting we cannot sustain yet.
+    const SKIP = /Fabrica|Gasta|Mejora|Compra/i;
+    const wanted = o.list.filter((x) => !SKIP.test(x.text));
+    if (LIVE) {
+      for (const offer of wanted) {
+        const res = await dailies.accept(g, offer.instanceId, o.csrf, { allowMutate: true });
+        accepted.push({ id: offer.instanceId, title: offer.title, status: res && res.status });
+        await sleep(400);
+      }
+    }
+  } catch (e) {
+    log(`dailies accept failed: ${e.message}`);
+  }
+
+  let claimed = [];
+  try {
+    const r = await dailies.claimAll(g, { allowMutate: LIVE });
+    claimed = r.claimed || [];
+  } catch (e) {
+    log(`dailies claim failed: ${e.message}`);
+  }
+
+  if (accepted.length) log(`dailies accepted: ${accepted.map((a) => a.title || a.id).join(', ')}`);
+  if (claimed.length) log(`dailies claimed: ${JSON.stringify(claimed)}`);
+  return { accepted, claimed };
+}
+
+/**
+ * Regeneration watchdog.
+ *
+ * A combat left in status "active" blocks ALL HP and mana regeneration (measured:
+ * regeneration.hp = 0, "0%/min"). Fight loops die mid-way whenever a fetch drops,
+ * which leaves exactly that state behind and silently freezes the hero forever.
+ * The check triggers on the symptom, so it costs nothing in the normal case:
+ * zero regen while vitals are below max => look for an open combat and abandon it.
+ */
+async function ensureOutOfCombat(g, hero) {
+  if (hero.regenHp === null || hero.regenHp === undefined) return { cleared: false, reason: 'regen unknown' };
+  if (hero.regenHp > 0) return { cleared: false, reason: 'regen ok' };
+  if (hero.hp >= hero.maxHp && hero.mana >= hero.maxMana) return { cleared: false, reason: 'full vitals' };
+
+  const { csrf, activeCombatId } = await combatCsrf(g);
+  if (!activeCombatId) return { cleared: false, reason: 'regen 0 with no open combat — investigate' };
+
+  const res = await abandonCombat(g, activeCombatId, csrf);
+  log(`WATCHDOG: abandoned stuck combat ${activeCombatId} (regen was 0%/min) — ${res.ok ? 'ok' : 'failed'}`);
+  return { cleared: !!res.ok, combatId: activeCombatId };
+}
+
+async function tick(g, state) {
+  const snap = await g.state();
+  let hero = await readHero(g);
+  const cleared = await ensureOutOfCombat(g, hero);
+  if (cleared.cleared) hero = await readHero(g);
+  let targets = rankTargets(hero);
+
+  log('state', {
+    lv: hero.level,
+    exp: `${snap.hero.exp}/${snap.hero.expToNext}`,
+    hp: `${hero.hp}/${hero.maxHp}`,
+    mana: `${hero.mana}/${hero.maxMana}`,
+    regenHp: hero.regenHp,
+    sta: hero.stamina,
+    gold: snap.production ? snap.production.perDay : undefined,
+    points: snap.attributes.available,
+    skillPoints: hero.skillPoints
+  });
+
+  // 2. free claims
+  const daily = await claimDailyLogin(g);
+  log(`daily_login: ${daily.done ? 'CLAIMED' : 'skip'} — ${daily.reason}`);
+  const prod = await claimProduction(g);
+  log(`production: ${prod.done ? 'CLAIMED' : 'skip'} — ${prod.reason}`);
+
+  const act = await activityProgress(g);
+  if (act) {
+    const reachable = [20, 40, 60, 80, 100].filter((m) => act.current >= m);
+    if (reachable.length) {
+      const res = await claimActivity(g, reachable);
+      log(`activity: ${res.done ? 'CLAIMED' : 'skip'} — ${res.reason}`);
+    } else {
+      log(`activity: skip — ${act.current}/${act.max}`);
+    }
+  }
+
+  // 2b. daily quests: accept first (progress only counts after accepting), then claim
+  await handleDailies(g);
+
+  // 3. spend what the game granted
+  const attr = await spendAttributePoints(g, hero, targets);  if (attr.done || attr.reason !== 'no points') log(`attributes: ${attr.done ? 'OK' : 'skip'} — ${attr.reason}`);
+  const skill = await spendSkillPoints(g, hero);
+  if (skill.done || skill.reason !== 'no skill points') log(`skills: ${skill.done ? 'OK' : 'skip'} — ${skill.reason}`);
+
+  try {
+    const tal = await talents.spendAll(g, { allowMutate: LIVE });
+    if (tal.done || (tal.reason && tal.reason !== 'no talent points')) {
+      log(`talents: ${tal.done ? 'OK' : 'skip'} — ${tal.done ? JSON.stringify(tal.applied) : tal.reason}`);
+    }
+  } catch (e) {
+    log(`talents failed: ${e.message}`);
+  }
+
+  hero = await readHero(g);
+  targets = rankTargets(hero);
+
+  const best = targets.find((t) => t.win);
+  if (!best) {
+    log('no winnable target with current stats — resting');
+    await restAtHospital(g);
+    return { rested: true };
+  }
+
+  const buffer = Math.round(hero.maxHp * 0.12);
+  const affordable = targets.filter((t) => t.win && t.hpCost + buffer <= hero.hp);
+  if (!affordable.length) {
+    const need = best.hpCost + buffer - hero.hp;
+    const perMin = Math.max(1, Math.round(hero.maxHp * 0.02));
+    log(`resting: need ${need} HP for ${best.name} (~${Math.ceil(need / perMin)} min at ${perMin} HP/min)`);
+    await restAtHospital(g);
+    return { rested: true };
+  }
+
+  // 4. fight
+  if (!LIVE) {
+    log(`dry run: would fight ${affordable.map((t) => `${t.name}(lv${t.level}, ${t.hpCost}HP/${t.exp}EXP)`).join(', ')}`);
+    return { fought: 0, dry: true };
+  }
+
+  let fought = 0;
+  for (const target of affordable) {
+    if (fought >= maxFights) break;
+    const fresh = rankTargets(await readHero(g)).find((t) => t.key === target.key);
+    const now = await readHero(g);
+    if (!fresh || !fresh.win || fresh.hpCost + buffer > now.hp) break;
+    if (now.stamina < target.stamina) {
+      log(`stamina too low for ${target.name} (${now.stamina}/${target.stamina})`);
+      break;
+    }
+
+    log(`fight ${target.name} (lv${target.level}) — predicted ${target.actions} actions, ${target.hpCost} HP, ${target.exp} EXP`);
+    const res = await fight(g, {
+      locationId: target.locationId,
+      enemyId: target.enemyId,
+      allowMutate: LIVE,
+      maxActions: 40
+    });
+    if (!res.ok) {
+      log(`fight aborted — ${res.error}`);
+      break;
+    }
+    log(`result ${res.won ? 'WIN' : 'LOSS'}`, {
+      rounds: res.rounds,
+      hp: `${res.hpBefore}->${res.hpAfter}`,
+      hpCost: res.hpCost,
+      exp: res.expGain,
+      gold: res.goldGain,
+      stamina: res.stamina,
+      level: res.level
+    });
+    fought += 1;
+    if (!res.won) break;
+  }
+
+  return { fought };
+}
+
+const lock = require('./lib/driverlock');
+
+/** Reconnect the CDP session, then re-login if the game session is gone. */
+async function recover(g) {
+  try {
+    if (g) g.close();
+  } catch (e) {}
+  const fresh = await Game.connect({ spawn: true });
+  if (await fresh.isLoggedIn()) return { g: fresh, action: 'reconnected' };
+  const creds = require('./lib/credentials').load();
+  if (!creds) throw new Error('no credentials available for recovery');
+  const res = await fresh.login(creds);
+  if (!res.ok) throw new Error('autonomous login failed');
+  return { g: fresh, action: 'relogged' };
+}
+
+(async () => {
+  const got = lock.acquire('runner');
+  if (!got.ok) {
+    log(`another driver is active (pid ${got.holder.pid}, ${got.holder.name}) — exiting`);
+    process.exit(2);
+  }
+
+  let g = await Game.connect({ spawn: true });
+  try {
+    if (!(await g.isLoggedIn())) {
+      log('session dead at start, logging in');
+      const creds = require('./lib/credentials').load();
+      if (!creds) throw new Error('no credentials available');
+      const res = await g.login(creds);
+      if (!res.ok) throw new Error('autonomous login failed');
+      log('login ok');
+    }
+
+    let cfg = await g.idleConfig();
+    let ticks = 0;
+    let failures = 0;
+
+    for (;;) {
+      try {
+        const hb = await g.heartbeat(cfg);
+        if (!hb.alive) {
+          cfg = await g.idleConfig();
+        }
+        ticks += 1;
+        await tick(g, { tick: ticks });
+        failures = 0;
+      } catch (e) {
+        failures += 1;
+        log(`tick failed (${failures}) — ${e.message}`);
+        const fatal = /AUTH|session|unavailable|page error|Inspected target|Failed to fetch|WebSocket|ECONN/i.test(
+          `${e.code || ''} ${e.message}`
+        );
+        if (fatal || failures >= 3) {
+          const r = await recover(g);
+          g = r.g;
+          cfg = await g.idleConfig();
+          failures = 0;
+          log(`recovered: ${r.action}`);
+        }
+      }
+      if (!loopSeconds) break;
+      log(`sleeping ${loopSeconds}s`);
+      await sleep(loopSeconds * 1000);
+    }
+  } finally {
+    try {
+      g.close();
+    } catch (e) {}
+    lock.release();
+  }
+})().catch((e) => {
+  log(`ERROR ${e.code || ''} ${e.message}`);
+  lock.release();
+  process.exit(1);
+});

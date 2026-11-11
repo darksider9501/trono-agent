@@ -1,0 +1,27 @@
+# This workspace is a shared drawer: dozens of unrelated experiments, browser
+# profiles, logs and screenshots live here. The repository tracks ONLY the
+# Defiende el Trono automation, so everything is ignored by default and the
+# relevant trees are re-included explicitly.
+*
+!/.gitignore
+!/scripts/
+!/scripts/lib/
+!/scripts/lib/**
+!/scripts/trono/
+!/scripts/trono/**
+!/docs/
+!/docs/trono/
+!/docs/trono/**
+
+# Volatile or regenerable artifacts inside the tracked tree
+scripts/trono/logs/
+scripts/trono/state/
+**/player_state_raw*.json
+**/driver.lock
+*.log
+npm-debug.log*
+
+# Never version secrets or credential material
+**/credentials.json
+**/.env
+**/.env.*
