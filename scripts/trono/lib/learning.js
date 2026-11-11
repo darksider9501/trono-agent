@@ -111,8 +111,15 @@ function summary() {
 
 function save() {
   try {
+    const all = load();
+    // Only keep targets that actually carry history. An entry with no fights and
+    // no cooldown is indistinguishable from a target never seen, so persisting it
+    // only makes the file unreadable.
+    for (const [key, e] of Object.entries(all)) {
+      if (!e.fights && !e.cooldownUntil) delete all[key];
+    }
     fs.mkdirSync(path.dirname(FILE), { recursive: true });
-    fs.writeFileSync(`${FILE}.tmp`, JSON.stringify(load(), null, 2));
+    fs.writeFileSync(`${FILE}.tmp`, JSON.stringify(all, null, 2));
     fs.renameSync(`${FILE}.tmp`, FILE);
   } catch (_) {
     // A failed write must never fail a tick.

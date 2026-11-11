@@ -134,10 +134,10 @@ Regeneration is **0 while any fight has `status: "active"`**.
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `HP_COST_MEAN` | 52 | measured mean HP per kill (39-65 observed range) |
+| `HP_COST_MEAN` | 52 | **cold-start prior only.** At runtime the per-target cost is the measured moving average in `state/learning.json` (`lib/learning.js`, α 0.35) and it overrides the simulated estimate. Measured at level 5: 15-54 HP per kill, so a flat 52 is wrong by up to 3x in both directions and must never be the only input |
+| `HP_BUFFER` | 12% of `maxHp` | HP held in reserve; a fight starts only when `hpCost + buffer <= hp` (`runner.js:332`). At `maxHp` 636 that is 76 HP |
 | `SAFETY_MULT` | 1.30 | multiplier on predicted HP cost before accepting a fight |
-| `HP_FLOOR` | 136 (28.6% of 476) | absolute HP below which no fight starts |
-| `REST_TARGET` | 476 | rest to full HP, not to a fraction |
+| ~~`HP_FLOOR`~~ ~~`REST_TARGET`~~ | not implemented | The spec's absolute floor (136) and rest target (476) were replaced by the relative `HP_BUFFER`. Neither exists in `runner.js`; do not use them as thresholds, and do not cite them as current behaviour |
 | `MAX_TICK_INTERVAL` | 6.5 h (390 min) | maximum gap between ticks while stamina exists |
 | `MAX_CONSECUTIVE_FAILURES` | 2 | consecutive fight failures before leaving combat |
 | `STAMINA_PER_KILL` | 3 | stamina cost per fight |
@@ -145,7 +145,7 @@ Regeneration is **0 while any fight has `status: "active"`**.
 | `HP_REGEN_PASSIVE` | 1.5% / min = 7.14 HP/min | outside the hospital |
 | `HP_REGEN_RESTING` | 2% / min = 9.52 HP/min | inside the hospital |
 | `KILLS_PER_DAY` | 80 | 240 stamina/day divided by 3 |
-| `MAX_HP_COST_PER_KILL` | 128.5 | threshold where HP starts to bind |
+| `MAX_HP_COST_PER_KILL` | `maxHp * 0.015 * 1440 / 80` | HP/day the hero regenerates divided by kills/day. At `maxHp` 636 this is 171.7; above that per-kill cost, HP binds before stamina and the target's real yield is capped by HP, not by stamina |
 
 Derivations:
 
@@ -201,7 +201,8 @@ Falsifiable, one run each:
 
 - **Does regeneration accrue while the browser is closed?** Unresolved. If it does not,
   HP becomes the binding constraint whenever online time is below roughly 9.7 h/day, and
-  `HP_COST_MEAN` stops being a useful predictor across sessions. Measure by comparing
-  `vitals.current.hp` at shutdown and at next start against the elapsed wall clock.
+  the per-target HP cost accumulated in `state/learning.json` stops being comparable across
+  sessions. Measure by comparing `vitals.current.hp` at shutdown and at next start against
+  the elapsed wall clock.
 - Whether the daily login reward's `request_id` is idempotency-checked server-side, or
   only format-validated. Treat every claim as non-retryable until measured.
