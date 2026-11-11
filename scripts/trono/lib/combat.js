@@ -178,6 +178,11 @@ function readSkillMeta(html, key) {
 /** Best fightable target ranked by EXP gained per HP spent (HP is the scarce resource). */
 function rankTargets(hero, enemies = ENCOUNTERS) {
   const rows = [];
+  // The two daily budgets that bound farmable gold. Stamina regenerates 10/hour
+  // (measured); HP regenerates 1.5%/min outside the hospital, the conservative
+  // rate (hospital rest is 2%/min).
+  const STAMINA_PER_DAY = 240;
+  const hpPerDay = hero.maxHp * 0.015 * 60 * 24;
   for (const enemy of Object.values(enemies)) {
     const sim = simulateFight({
       enemy,
@@ -204,12 +209,25 @@ function rankTargets(hero, enemies = ENCOUNTERS) {
       affordable: sim.win && sim.hpCost + (hero.hpBuffer || 0) <= hero.hp,
       expPerHp: sim.win ? +(enemy.exp / Math.max(1, sim.hpCost)).toFixed(3) : 0,
       goldPerHp: sim.win ? +(enemy.gold / Math.max(1, sim.hpCost)).toFixed(4) : 0,
-      expPerStamina: sim.win ? +(enemy.exp / Math.max(1, enemy.stamina)).toFixed(2) : 0
+      expPerStamina: sim.win ? +(enemy.exp / Math.max(1, enemy.stamina)).toFixed(2) : 0,
+      // Daily gold is bounded by whichever runs out first: the 240 stamina the
+      // hero regenerates per day, or the HP it regenerates per day. Ranking by
+      // EXP per HP optimised the resource that is NOT scarce; this ranks by the
+      // yield that actually caps the day.
+      goldPerStamina: sim.win ? +(enemy.gold / Math.max(1, enemy.stamina)).toFixed(3) : 0,
+      goldPerDay: sim.win
+        ? +(
+            Math.min(
+              STAMINA_PER_DAY / Math.max(1, enemy.stamina),
+              hpPerDay / Math.max(1, sim.hpCost)
+            ) * enemy.gold
+          ).toFixed(1)
+        : 0
     });
   }
   rows.sort((a, b) => {
     if (a.win !== b.win) return a.win ? -1 : 1;
-    return b.expPerHp - a.expPerHp || b.expPerStamina - a.expPerStamina;
+    return b.goldPerDay - a.goldPerDay || b.goldPerHp - a.goldPerHp;
   });
   return rows;
 }

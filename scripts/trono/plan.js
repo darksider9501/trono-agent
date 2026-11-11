@@ -27,7 +27,7 @@ const asJson = process.argv.includes('--json');
         `skill ${hero.skill ? `${hero.skill.key} ${Math.round(hero.skill.power * 100)}%` : 'none'}`
     );
     console.log('');
-    console.log('enemy      lv  hp   dmg def sta  exp gold  | verdict  actions  hpCost  exp/hp  exp/sta  now');
+    console.log('enemy      lv  hp   dmg def sta  exp gold  | verdict  actions  hpCost  exp/hp  exp/sta  now   gold/day');
     console.log('----------- -- ---- ---- --- --- ---- ----  | -------- -------  ------  ------  -------  ---');
     for (const r of rows) {
       console.log(
@@ -36,7 +36,7 @@ const asJson = process.argv.includes('--json');
           `${String(r.stamina).padStart(3)} ${String(r.exp).padStart(4)} ${String(r.gold).padStart(4)}  | ` +
           `${(r.win ? 'WIN' : 'LOSE').padEnd(8)} ${String(r.actions).padStart(7)} ` +
           `${String(r.hpCost).padStart(7)} ${String(r.expPerHp).padStart(7)} ${String(r.expPerStamina).padStart(7)}  ` +
-          `${r.affordable ? 'yes' : 'no '}`
+          `${r.affordable ? 'yes' : 'no '}  ${String(r.goldPerDay).padStart(8)}`
       );
     }
     const best = rows.find((r) => r.win);

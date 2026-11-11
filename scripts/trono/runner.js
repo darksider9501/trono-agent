@@ -26,9 +26,13 @@ const dailies = require('./lib/dailies');
 const talents = require('./lib/talents');
 
 const args = process.argv.slice(2);
-const LIVE = args.includes('--live');
+// The Agent Hub executes [runtime, script] with no arguments, so the live flag
+// and the loop interval can also arrive as environment variables.
+const LIVE = args.includes('--live') || process.env.TRONO_LIVE === '1';
 const loopArg = args.find((a) => a.startsWith('--loop='));
-const loopSeconds = loopArg ? parseInt(loopArg.split('=')[1], 10) : 0;
+const loopSeconds = loopArg
+  ? parseInt(loopArg.split('=')[1], 10)
+  : parseInt(process.env.TRONO_LOOP || '0', 10) || 0;
 const fightsArg = args.find((a) => a.startsWith('--fights='));
 const maxFights = fightsArg ? parseInt(fightsArg.split('=')[1], 10) : 2;
 
@@ -316,9 +320,9 @@ async function tick(g, state) {
   }
 
   hero = await readHero(g);
-  targets = rankTargets(hero);
+  targets = learning.apply(rankTargets(hero), hero);
 
-  const best = targets.find((t) => t.win);
+  const best = targets.find((t) => t.win && !t.coolingDown);
   if (!best) {
     log('no winnable target with current stats — resting');
     await restAtHospital(g);
@@ -326,7 +330,7 @@ async function tick(g, state) {
   }
 
   const buffer = Math.round(hero.maxHp * 0.12);
-  const affordable = targets.filter((t) => t.win && t.hpCost + buffer <= hero.hp);
+  const affordable = targets.filter((t) => t.win && !t.coolingDown && t.hpCost + buffer <= hero.hp);
   if (!affordable.length) {
     const need = best.hpCost + buffer - hero.hp;
     const perMin = Math.max(1, Math.round(hero.maxHp * 0.02));
@@ -344,9 +348,10 @@ async function tick(g, state) {
   let fought = 0;
   for (const target of affordable) {
     if (fought >= maxFights) break;
-    const fresh = rankTargets(await readHero(g)).find((t) => t.key === target.key);
-    const now = await readHero(g);
-    if (!fresh || !fresh.win || fresh.hpCost + buffer > now.hp) break;
+    const freshHero = await readHero(g);
+    const fresh = learning.apply(rankTargets(freshHero), freshHero).find((t) => t.key === target.key);
+    const now = freshHero;
+    if (!fresh || !fresh.win || fresh.coolingDown || fresh.hpCost + buffer > now.hp) break;
     if (now.stamina < target.stamina) {
       log(`stamina too low for ${target.name} (${now.stamina}/${target.stamina})`);
       break;
@@ -372,14 +377,17 @@ async function tick(g, state) {
       stamina: res.stamina,
       level: res.level
     });
+    learning.record(target.key, { hpCost: res.hpCost, won: !!res.won });
     fought += 1;
     if (!res.won) break;
   }
+  learning.save();
 
   return { fought };
 }
 
 const lock = require('./lib/driverlock');
+const learning = require('./lib/learning');
 
 /** Reconnect the CDP session, then re-login if the game session is gone. */
 async function recover(g) {
