@@ -369,9 +369,18 @@ async function recover(g) {
   if (await fresh.isLoggedIn()) return { g: fresh, action: 'reconnected' };
   const creds = require('./lib/credentials').load();
   if (!creds) throw new Error('no credentials available for recovery');
-  const res = await fresh.login(creds);
-  if (!res.ok) throw new Error('autonomous login failed');
-  return { g: fresh, action: 'relogged' };
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fresh.login(creds);
+      if (res.ok) return { g: fresh, action: 'relogged' };
+      lastError = new Error(`autonomous login rejected: ${JSON.stringify(res).slice(0, 200)}`);
+    } catch (e) {
+      lastError = e;
+    }
+    if (attempt < 3) await sleep(15000 * attempt);
+  }
+  throw lastError || new Error('autonomous login failed');
 }
 
 (async () => {
@@ -383,18 +392,33 @@ async function recover(g) {
 
   let g = await Game.connect({ spawn: true });
   try {
+    // Startup login with bounded retries. A single transient failure
+    // (maintenance window, 401 race, CSRF glitch) used to exit(1) and force a
+    // manual login by the human.
+    const loginWithRetries = async (attempts = 5) => {
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        const creds = require('./lib/credentials').load();
+        if (!creds) throw new Error('no credentials available');
+        const res = await g.login(creds).catch((e) => ({ ok: false, error: e.message }));
+        if (res.ok) {
+          log(`login ok (attempt ${attempt})`);
+          return true;
+        }
+        log(`login failed (attempt ${attempt}/${attempts}) — ${JSON.stringify(res).slice(0, 200)}`);
+        if (attempt < attempts) await sleep(20000 * attempt);
+      }
+      return false;
+    };
+
     if (!(await g.isLoggedIn())) {
       log('session dead at start, logging in');
-      const creds = require('./lib/credentials').load();
-      if (!creds) throw new Error('no credentials available');
-      const res = await g.login(creds);
-      if (!res.ok) throw new Error('autonomous login failed');
-      log('login ok');
+      if (!(await loginWithRetries())) throw new Error('autonomous login failed after retries');
     }
 
     let cfg = await g.idleConfig();
     let ticks = 0;
     let failures = 0;
+    let recoverFailures = 0;
 
     for (;;) {
       try {
@@ -412,11 +436,21 @@ async function recover(g) {
           `${e.code || ''} ${e.message}`
         );
         if (fatal || failures >= 3) {
-          const r = await recover(g);
-          g = r.g;
-          cfg = await g.idleConfig();
-          failures = 0;
-          log(`recovered: ${r.action}`);
+          try {
+            const r = await recover(g);
+            g = r.g;
+            cfg = await g.idleConfig();
+            failures = 0;
+            recoverFailures = 0;
+            log(`recovered: ${r.action}`);
+          } catch (re) {
+            // Never let a failed recovery kill the process — that is exactly what
+            // forced a manual login. Back off and let the loop try again.
+            recoverFailures += 1;
+            log(`recovery failed (${recoverFailures}) — ${re.message}`);
+            if (recoverFailures >= 5) throw re;
+            await sleep(30000 * recoverFailures);
+          }
         }
       }
       if (!loopSeconds) break;
