@@ -146,6 +146,11 @@ async function readHero(g) {
     hp: pv ? pv.current.hp : d.vitals.current.hp,
     mana: pv ? pv.current.mana : d.vitals.current.mana,
     stamina: pv ? pv.current.stamina : d.vitals.current.stamina,
+    // Wallet balances. player_state is the only endpoint that carries them, and
+    // without them the run cannot show progress toward the withdrawal threshold.
+    gold: ps && ps.ok && ps.state && ps.state.economy ? ps.state.economy.gold : null,
+    dotirian: ps && ps.ok && ps.state && ps.state.economy ? ps.state.economy.dotirian : null,
+    gems: ps && ps.ok && ps.state && ps.state.economy ? ps.state.economy.gems : null,
     // 0 while any combat is active — the runner's watchdog watches this number.
     regenHp: pv && pv.regeneration ? pv.regeneration.hp : null,
     regenMana: pv && pv.regeneration ? pv.regeneration.mana : null,

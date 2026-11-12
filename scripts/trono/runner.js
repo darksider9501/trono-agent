@@ -33,6 +33,11 @@ const loopArg = args.find((a) => a.startsWith('--loop='));
 const loopSeconds = loopArg
   ? parseInt(loopArg.split('=')[1], 10)
   : parseInt(process.env.TRONO_LOOP || '0', 10) || 0;
+
+// Verified in the economy page: 10,000 gold buys 1 DOTIRIA and 1 DOTIRIA pays 1
+// USDT (`data-unit="10000" data-reward="1"`). The first withdrawal allows 10-15
+// USDT with no prior deposit, so 100,000 gold is the shortest path to a payout.
+const WITHDRAW_GOLD = 100000;
 const fightsArg = args.find((a) => a.startsWith('--fights='));
 const maxFights = fightsArg ? parseInt(fightsArg.split('=')[1], 10) : 2;
 
@@ -132,29 +137,31 @@ async function activityProgress(g) {
 }
 
 /**
- * Spend attribute points where the predictor says they buy the most progress:
- * the allocation that maximises EXP per HP on the current best target.
+ * Spend attribute points where they buy the most gold per day.
+ *
+ * lib/attributes.js owns the choice: it scores each attribute by the gold/day it
+ * adds under whichever budget binds first, using the HP cost the bot has actually
+ * been paying. Every spend is also a measurement — the response carries the new
+ * derived snapshot, so the coefficient the UI documents is checked against what
+ * the server did and corrected when it differs.
  */
 async function spendAttributePoints(g, hero, targets) {
   const available = await g.apiGet('/api/hero_attributes.php');
   let points = (available && available.data && available.data.points_available) || 0;
   if (points <= 0) return { done: false, reason: 'no points' };
 
+  const model = attributes.load();
   const applied = [];
+  let snapshot = (available.data && available.data.overview) || null;
+
   while (points > 0) {
-    const best = targets.find((t) => t.win) || targets[0];
-    const score = {};
-    for (const attr of ['vitality', 'strength']) {
-      const probe = {
-        ...hero,
-        maxHp: hero.maxHp + (attr === 'vitality' ? 10 : 0),
-        armor: hero.armor + (attr === 'vitality' ? 1 : 0),
-        atkDmg: hero.atkDmg + (attr === 'strength' ? 2 : 0)
-      };
-      const sim = rankTargets(probe).find((t) => t.key === best.key);
-      score[attr] = sim && sim.win ? sim.expPerHp : 0;
-    }
-    const chosen = score.vitality >= score.strength ? 'vitality' : 'strength';
+    const ranked = attributes.choose(hero, model);
+    const pick = ranked[0];
+    // Every attribute scored zero: no target is winnable at all. Damage is the
+    // only thing that changes that and it does so before the simulation can see
+    // it, so spend there rather than leaving the point idle.
+    const fallback = !pick || pick.goldPerDay <= 0;
+    const chosen = fallback ? 'strength' : pick.attr;
 
     const page = await g.fetchPage('/pages/overview.php');
     const m = /data-api="\/api\/hero_attributes.php" data-csrf="([0-9a-f]{64})"/.exec(page.html) ||
@@ -166,30 +173,88 @@ async function spendAttributePoints(g, hero, targets) {
       csrf: m[1]
     });
     if (!res || !res.ok) return { done: applied.length > 0, reason: (res && res.message) || 'post failed', applied };
-    applied.push(chosen);
-    if (chosen === 'vitality') {
-      hero.maxHp += 10;
-      hero.armor += 1;
-    } else {
-      hero.atkDmg += 2;
-    }
-    points = res.data ? res.data.points_available : points - 1;
+
+    const measured = attributes.verify(chosen, snapshot, res.data && res.data.overview, model);
+    if (measured) log(`attribute model: ${chosen} measured ${JSON.stringify(measured)}`);
+    snapshot = (res.data && res.data.overview) || snapshot;
+
+    applied.push(`${chosen}${fallback ? '(fallback)' : `(${pick.goldPerDay}g/d)`}`);
+    // Re-read instead of trusting the projection: the next point must be scored
+    // against what the hero really is, not against what this loop expected.
+    hero = await readHero(g);
+    points = res.data && res.data.points_available !== undefined
+      ? Number(res.data.points_available)
+      : points - 1;
+    attributes.save(model);
   }
   return { done: true, reason: `applied ${applied.join(', ')}`, applied };
 }
 
-/** Skill points: keep upgrading the primary damage skill. */
+/**
+ * Skill points: upgrade whichever learned skill buys the most gold per day.
+ *
+ * Every card publishes its current and next power (`data-skill-power`,
+ * `data-skill-next-power`), so one level's effect is known before paying for it.
+ * The projected level goes through the same simulation and the same gold-per-day
+ * rule as attribute points, instead of always upgrading whatever came first.
+ *
+ * Only skills already at level 1 or above are considered. The simulation has no
+ * model for stun, shields or healing, so unlocking an untrained skill would be
+ * scored on its damage percentage alone and that score would be misleading.
+ */
 async function spendSkillPoints(g, hero) {
   if (!hero.skillPoints) return { done: false, reason: 'no skill points' };
-  const key = hero.skill ? hero.skill.key : 'wildfire_bolt';
   const page = await g.fetchPage('/pages/skills.php');
-  const m = /data-skills-page[\s\S]{0,300}?data-csrf="([0-9a-f]+)"/.exec(page.html);
-  if (!m) return { done: false, reason: 'no skills csrf' };
-  const res = await g.apiPost('/api/hero_skill_upgrade.php', { skill_key: key }, {
+  const csrfM = /data-skills-page[\s\S]{0,300}?data-csrf="([0-9a-f]+)"/.exec(page.html);
+  if (!csrfM) return { done: false, reason: 'no skills csrf' };
+
+  const cards = [];
+  for (const block of page.html.split('data-skill-card').slice(1)) {
+    const attr = (n) => {
+      const m = new RegExp(`data-skill-${n}="([^"]*)"`).exec(block);
+      return m ? m[1] : null;
+    };
+    const key = attr('key');
+    if (!key) continue;
+    const level = Number(attr('level') || 0);
+    const max = Number(attr('max-level') || 10);
+    if (level < 1 || level >= max) continue;
+    const power = Number(attr('power') || 0) / 100;
+    const next = Number(attr('next-power') || 0) / 100;
+    if (!(next > power)) continue;
+    const burn = /Quemadura: ([\d.]+)%/.exec(attr('description') || '');
+    cards.push({
+      key,
+      level,
+      next,
+      mana: Number(attr('mana') || 0),
+      cd: Number(attr('cooldown') || 2),
+      burnRatio: burn ? Number(burn[1]) / 100 : 0
+    });
+  }
+  if (!cards.length) return { done: false, reason: 'nothing upgradable' };
+
+  const ranked = cards
+    .map((c) => {
+      const probe = {
+        ...hero,
+        skill: { key: c.key, power: c.next, mana: c.mana, cd: c.cd, burnRatio: c.burnRatio }
+      };
+      const best = learning.apply(rankTargets(probe), probe).find((r) => r.win && !r.coolingDown);
+      return { ...c, goldPerDay: best ? best.goldPerDay : 0 };
+    })
+    .sort((a, b) => b.goldPerDay - a.goldPerDay || b.next - a.next);
+
+  const pick = ranked[0];
+  const res = await g.apiPost('/api/hero_skill_upgrade.php', { skill_key: pick.key }, {
     allowMutate: LIVE,
-    csrf: m[1]
+    csrf: csrfM[1]
   });
-  return { done: !!(res && res.ok), reason: res && res.ok ? `${key} upgraded` : (res && res.message) || 'failed' };
+  if (!res || !res.ok) return { done: false, reason: (res && res.message) || 'failed' };
+  return {
+    done: true,
+    reason: `${pick.key} lv${pick.level}->${pick.level + 1} (${pick.goldPerDay}g/d)`
+  };
 }
 
 /** Rest at the hospital for the +0.5%/min HP bonus while waiting. */
@@ -280,10 +345,19 @@ async function tick(g, state) {
     mana: `${hero.mana}/${hero.maxMana}`,
     regenHp: hero.regenHp,
     sta: hero.stamina,
-    gold: snap.production ? snap.production.perDay : undefined,
+    // The wallet, not the production rate. `gold` used to log
+    // snap.production.perDay, which is 164.5 every tick and says nothing about
+    // progress toward a payout.
+    gold: hero.gold,
+    dotirian: hero.dotirian,
+    prodPerDay: snap.production ? snap.production.perDay : undefined,
     points: snap.attributes.available,
     skillPoints: hero.skillPoints
   });
+  if (hero.gold !== null && hero.gold !== undefined) {
+    const pct = ((hero.gold / WITHDRAW_GOLD) * 100).toFixed(1);
+    log(`wallet: ${hero.gold} gold (${pct}% of ${WITHDRAW_GOLD})  ${hero.dotirian ?? '?'} DOTIRIA`);
+  }
 
   // 2. free claims
   const daily = await claimDailyLogin(g);
@@ -388,6 +462,7 @@ async function tick(g, state) {
 
 const lock = require('./lib/driverlock');
 const learning = require('./lib/learning');
+const attributes = require('./lib/attributes');
 
 /** Reconnect the CDP session, then re-login if the game session is gone. */
 async function recover(g) {
