@@ -20,6 +20,7 @@
  * because HP is the scarcest resource (regen ~2%/min while resting at the hospital).
  */
 const { HOST } = require('./game');
+const { randomUUID } = require('crypto');
 
 const COMBAT_API = '/api/combat_pve.php';
 
@@ -146,6 +147,10 @@ async function readHero(g) {
     hp: pv ? pv.current.hp : d.vitals.current.hp,
     mana: pv ? pv.current.mana : d.vitals.current.mana,
     stamina: pv ? pv.current.stamina : d.vitals.current.stamina,
+    // The stamina ceiling decides whether a quiet minute costs anything: below
+    // the cap stamina regeneration is banked, at the cap it is thrown away. The
+    // fight selector needs it to tell "wait for HP" from "spend before it caps".
+    maxStamina: (pv && pv.max && pv.max.stamina) || (d.vitals.max && d.vitals.max.stamina) || 65,
     // Wallet balances. player_state is the only endpoint that carries them, and
     // without them the run cannot show progress toward the withdrawal threshold.
     gold: ps && ps.ok && ps.state && ps.state.economy ? ps.state.economy.gold : null,
@@ -259,13 +264,14 @@ async function combatCsrf(g, query = '') {
  */
 async function abandonCombat(g, combatId, csrf) {
   if (!combatId) return { ok: false, reason: 'no combat id' };
-  const res = await g.evalInPage(`(async () => {
-    const r = await fetch(${JSON.stringify(COMBAT_API)}, { method:'POST', credentials:'same-origin',
-      headers:{'Content-Type':'application/json','X-CSRF-Token':${JSON.stringify(csrf)}},
-      body: JSON.stringify({operation:'recover_abandon', combat_id:${combatId}, csrf:${JSON.stringify(csrf)}}) });
-    return { status: r.status, body: await r.json().catch(() => null) };
-  })()`, 60000);
-  return { ok: res.status === 200, status: res.status, body: res.body };
+  // Recovering a stuck combat is repair, not spending: it frees regeneration, so
+  // it runs in dry mode too, exactly like it did through evalInPage before.
+  const body = await g.apiPost(
+    COMBAT_API,
+    { operation: 'recover_abandon', combat_id: combatId, csrf },
+    { allowMutate: true, csrf }
+  );
+  return { ok: !!(body && body.ok !== false), body };
 }
 
 /**
@@ -285,12 +291,7 @@ async function fight(g, opts) {
 
   // Abandon a stale active combat so the server does not reject the new one.
   if (activeCombatId) {
-    await g.evalInPage(`(async () => {
-      await fetch(${JSON.stringify(COMBAT_API)}, { method:'POST', credentials:'same-origin',
-        headers:{'Content-Type':'application/json','X-CSRF-Token':${JSON.stringify(csrf)}},
-        body: JSON.stringify({operation:'recover_abandon', combat_id:${activeCombatId}, csrf:${JSON.stringify(csrf)}}) });
-      return true;
-    })()`);
+    await abandonCombat(g, activeCombatId, csrf).catch(() => {});
   }
 
   const hero = await readHero(g);
@@ -300,37 +301,54 @@ async function fight(g, opts) {
   const expBefore = before.state.hero.hero_exp;
   const goldBefore = before.state.economy.gold;
 
-  const result = await g.evalInPage(`(async () => {
-    const url = ${JSON.stringify(COMBAT_API)};
-    const csrf = ${JSON.stringify(csrf)};
-    const uuid = () => { const b = new Uint8Array(16); crypto.getRandomValues(b);
-      b[6]=(b[6]&15)|64; b[8]=(b[8]&63)|128;
-      return [...b].map((v,i)=>((i==4||i==6||i==8||i==10)?'-':'')+v.toString(16).padStart(2,'0')).join(''); };
-    const post = async (p) => { const r = await fetch(url, { method:'POST', credentials:'same-origin',
-      headers:{'Content-Type':'application/json','X-CSRF-Token':csrf}, body: JSON.stringify(p) });
-      return await r.json().catch(() => ({ ok:false, message:'bad json' })); };
+  // One POST per action instead of one in-page loop. Same payloads, same order;
+  // what changes is that this code now runs over either transport (browser tab or
+  // plain HTTP) and goes through apiPost, which honours allowMutate. The in-page
+  // version ignored it, so `--dry` used to fight for real.
+  const maxActions = opts.maxActions || 40;
+  const post = (payload) => g.apiPost(COMBAT_API, payload, { allowMutate: opts.allowMutate, csrf });
+  let result;
 
-    const c = await post({ operation:'create_from_world',
-      location_id: ${locationId}, world_enemy_id: ${enemyId},
-      practice_hp: ${practice.hp}, practice_damage: ${practice.damage}, practice_armor: ${practice.armor},
-      request_id: uuid(), csrf });
-    if (!c.ok) return { error: c.message || 'create failed', errorType: c.error_type || null };
-    const cid = c.data.state.battle.combat_id;
+  const created = await post({
+    operation: 'create_from_world',
+    location_id: locationId,
+    world_enemy_id: enemyId,
+    practice_hp: practice.hp,
+    practice_damage: practice.damage,
+    practice_armor: practice.armor,
+    request_id: randomUUID(),
+    csrf
+  });
 
-    const skillKey = ${JSON.stringify(skillKey)};
-    let status = c.data.state.battle.status;
+  if (!created || !created.ok) {
+    result = {
+      error: (created && created.message) || 'create failed',
+      errorType: (created && created.error_type) || null
+    };
+  } else {
+    const cid = created.data.state.battle.combat_id;
+    let status = created.data.state.battle.status;
+    let last = created.data.state;
     const log = [];
-    let last = c.data.state;
-    for (let i = 0; i < ${opts.maxActions || 40} && status === 'active'; i++) {
-      const j = skillKey
-        ? await post({ operation:'skill', skill_key: skillKey, repeat_count: 1, combat_id: cid, request_id: uuid(), csrf })
-        : await post({ operation:'attack', combat_id: cid, request_id: uuid(), csrf });
-      let out = j;
+    for (let i = 0; i < maxActions && status === 'active'; i++) {
+      let out = skillKey
+        ? await post({
+            operation: 'skill',
+            skill_key: skillKey,
+            repeat_count: 1,
+            combat_id: cid,
+            request_id: randomUUID(),
+            csrf
+          })
+        : await post({ operation: 'attack', combat_id: cid, request_id: randomUUID(), csrf });
       // Skill on cooldown or out of mana -> fall back to the basic attack.
-      if (!j.ok && skillKey) {
-        out = await post({ operation:'attack', combat_id: cid, request_id: uuid(), csrf });
+      if ((!out || !out.ok) && skillKey) {
+        out = await post({ operation: 'attack', combat_id: cid, request_id: randomUUID(), csrf });
       }
-      if (!out.ok) { log.push({ i, err: out.message || 'action failed' }); break; }
+      if (!out || !out.ok) {
+        log.push({ i, err: (out && out.message) || 'action failed' });
+        break;
+      }
       const st = out.data.state;
       last = st;
       status = st.battle.status;
@@ -339,7 +357,7 @@ async function fight(g, opts) {
       log.push({ i, myHp: me.hp_current, myMp: me.mp_current, enemyHp: en.hp_current, status });
     }
 
-    return {
+    result = {
       combatId: cid,
       status,
       endReason: last.battle ? last.battle.end_reason : null,
@@ -348,7 +366,7 @@ async function fight(g, opts) {
       meta: last.meta || null,
       stamina: last.meta && last.meta.stamina ? last.meta.stamina.current : null
     };
-  })()`, 120000);
+  }
 
   if (result.error) {
     // Even a rejected/aborted action can leave the combat open (that is what froze
