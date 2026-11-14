@@ -52,6 +52,13 @@ const loopSeconds = loopArg
   ? parseInt(loopArg.split('=')[1], 10)
   : parseInt(process.env.TRONO_LOOP || '0', 10) || 0;
 
+// How long to wait when the game says it is in maintenance. Waiting IS the
+// correct response: nothing here is a detection, and reopening a browser or
+// logging in again during a maintenance window is exactly the pointless,
+// repeated-authentication pattern the breaker exists to avoid. One cheap request
+// every five minutes also notices the moment the window ends.
+const MAINTENANCE_WAIT_MS = 5 * 60 * 1000;
+
 // Verified in the economy page: 10,000 gold buys 1 DOTIRIA and 1 DOTIRIA pays 1
 // USDT (`data-unit="10000" data-reward="1"`). The first withdrawal allows 10-15
 // USDT with no prior deposit, so 100,000 gold is the shortest path to a payout.
@@ -664,18 +671,26 @@ async function recover(g) {
           log(`SECURITY HALT — stopping the agent. ${e.message}`);
           throw e;
         }
+        // A maintenance window is routine. It must not count as a failure (that
+        // would trigger recover() on the third one) and it must never look like a
+        // detection, so it just waits and tries again.
+        if (e && e.code === 'MAINTENANCE') {
+          log(`maintenance window — ${e.message}. waiting ${MAINTENANCE_WAIT_MS / 60000} min`);
+          await sleep(MAINTENANCE_WAIT_MS);
+          continue;
+        }
         failures += 1;
         log(`tick failed (${failures}) — ${e.message}`);
-        // An error that declares itself retryable is never a reason to rebuild the
-        // transport. Reopening a browser and logging in again cannot fix a socket,
-        // and the repeated-login path is exactly what marks an account. It still
-        // counts toward `failures`, so a network that is really down recovers.
+        // Rebuilding the transport is the heavy, account-risky move: it can reopen
+        // a browser and log in again. A retryable error is never worth that -- the
+        // transport is intact, the world is not -- so it only counts up, which
+        // keeps an outage visible in the log without poking the site with logins.
         const fatal =
-          !e.retryable &&
           /AUTH|session|unavailable|page error|Inspected target|Failed to fetch|WebSocket|ECONN/i.test(
             `${e.code || ''} ${e.message}`
           );
-        if (fatal || failures >= 3) {
+        const rebuild = !e.retryable && (fatal || failures >= 3);
+        if (rebuild) {
           try {
             const r = await recover(g);
             g = r.g;

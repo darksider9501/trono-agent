@@ -38,6 +38,27 @@ class SecurityHalt extends Error {
 }
 
 /**
+ * The game is down on its own schedule. Not a gate, and not ours to fix.
+ *
+ * Measured 2026-11-14: the breaker halted the farm on a `503` whose body was the
+ * game saying `{"ok":false,"maintenance":true,"message":"El juego está en
+ * mantenimiento..."}`. Nothing about that is a detection: it is a routine window,
+ * it clears itself, and demanding a human to release it turned a 20-minute outage
+ * into a stopped agent. Retryable on purpose, and it writes NO halt file, so the
+ * runner can simply wait it out.
+ */
+class MaintenanceWindow extends Error {
+  constructor(message, info = {}) {
+    super(message);
+    this.name = 'MaintenanceWindow';
+    this.code = 'MAINTENANCE';
+    this.retryable = true;
+    this.where = info.where || null;
+    this.status = info.status === undefined ? null : info.status;
+  }
+}
+
+/**
  * Strong markers: a string that has no business appearing in game UI. Hitting
  * one means a human-verification interstitial, not a game page.
  */
@@ -67,6 +88,16 @@ const STATUS_SIGNALS = {
   429: 'rate-limited',
   503: 'service-unavailable'
 };
+
+/**
+ * The game's own maintenance flag, which is the one 503 that is not a gate.
+ *
+ * `"maintenance":true` is unambiguous: no bot-management layer writes our JSON.
+ * The prose variant only counts on an error status, so a page that happens to
+ * mention maintenance in its UI copy can never make the agent sit and wait.
+ */
+const MAINTENANCE_JSON = /"maintenance"\s*:\s*true/i;
+const MAINTENANCE_TEXT = /en mantenimiento|under maintenance|scheduled maintenance/i;
 
 /** Cookie names set by bot-management vendors. A new one is a new layer. */
 const BOT_COOKIE = /^(__cf|cf_clearance|_px|_pxhd|datadome|dd_|_abck|ak_bmsc|bm_sz|incap_ses|visid_incap)/i;
@@ -159,26 +190,42 @@ function statusSignals(status) {
  * `text` is optional: a HEAD-like caller may only have a status. Strong markers
  * are checked on any status; weak ones only on an error status, to keep game
  * copy from tripping the breaker.
+ *
+ * Order matters. A real gate always wins, even if its page also mentions
+ * maintenance; only when there is no gate evidence at all does the game's own
+ * maintenance flag downgrade the response from "stop everything" to "wait".
  */
 function inspect({ where, url, status, text, headers }) {
-  const signals = statusSignals(status);
   const body = typeof text === 'string' ? text : '';
   const isError = typeof status === 'number' && status >= 400;
 
+  const strong = [];
   for (const [name, re] of STRONG) {
-    if (re.test(body)) signals.push(name);
+    if (re.test(body)) strong.push(name);
   }
+  if (headers && typeof headers === 'object') {
+    const server = String(headers.server || '');
+    if (/cloudflare/i.test(server)) strong.push('cloudflare-server');
+    if (/datadome|perimeterx|akamai/i.test(server)) strong.push('edge-bot-manager');
+  }
+  if (strong.length) {
+    const record = trip({ where, url, status, signals: [...new Set(strong)], excerpt: body.slice(0, 400) });
+    throw new SecurityHalt(`SECURITY_HALT: ${where} returned ${[...new Set(strong)].join(', ')}`, record);
+  }
+
+  if (MAINTENANCE_JSON.test(body) || (isError && MAINTENANCE_TEXT.test(body))) {
+    throw new MaintenanceWindow(
+      `MAINTENANCE: ${where} returned ${status || 'no status'} — the game is down on its own schedule`,
+      { where, status }
+    );
+  }
+
+  const signals = statusSignals(status);
   if (isError) {
     for (const [name, re] of WEAK) {
       if (re.test(body)) signals.push(name);
     }
   }
-  if (headers && typeof headers === 'object') {
-    const server = String(headers.server || '');
-    if (/cloudflare/i.test(server)) signals.push('cloudflare-server');
-    if (/datadome|perimeterx|akamai/i.test(server)) signals.push('edge-bot-manager');
-  }
-
   if (!signals.length) return { ok: true };
 
   // De-duplicate while keeping order, so the report reads like a diagnosis.
@@ -239,6 +286,7 @@ module.exports = {
   HALT_PATH,
   HALT_LOG,
   SecurityHalt,
+  MaintenanceWindow,
   readHalt,
   isHalted,
   assertClear,

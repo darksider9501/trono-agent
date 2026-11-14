@@ -167,7 +167,13 @@ class GameHttp {
       }
     }
     if (!res) {
-      throw new Error(`network: ${last.message}${tries > 1 ? ` (replayed ${tries - 1}x)` : ''}`);
+      const err = new Error(`network: ${last.message}${tries > 1 ? ` (replayed ${tries - 1}x)` : ''}`);
+      // A network that is down is not a session problem, and rebuilding the
+      // transport cannot fix it. Marking it retryable keeps the runner from
+      // relogging into an outage -- the repeated-authentication pattern that
+      // actually gets an account flagged.
+      err.retryable = true;
+      throw err;
     }
 
     const text = await res.text();
