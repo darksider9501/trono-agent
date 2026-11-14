@@ -42,12 +42,13 @@ function entry(key) {
 }
 
 /** Record one finished fight against a target. */
-function record(key, { hpCost, won }) {
+function record(key, { hpCost, won, level }) {
   const e = entry(key);
   e.fights += 1;
   if (Number.isFinite(hpCost) && hpCost > 0) {
     e.hpCost = e.hpCost === null ? +hpCost.toFixed(1) : +(e.hpCost * (1 - ALPHA) + hpCost * ALPHA).toFixed(1);
   }
+  if (Number.isFinite(level)) e.level = level;
   if (won) {
     e.wins += 1;
     e.losses = 0;
@@ -74,15 +75,52 @@ function available(key) {
  *
  * Recomputes gold/day from the measured HP cost and pushes cooling targets to
  * the back. Mutates and re-sorts the rows in place, then returns them.
+ *
+ * Measured fights outrank the simulator, and the simulator is treated as a
+ * weak signal on purpose. On 2026-11-12 it predicted 224 HP for Eryndor and a
+ * win; the real fight cost 310 HP, ended in a loss and took 79 gold with it.
+ * The same model underestimated Brumak by 3.4x, Aeril by 11.7x and Virex by 11x,
+ * so an unmeasured target is only worth a probe when the model calls it almost
+ * free, and never when the enemy outlevels the hero.
  */
 function apply(rows, hero) {
   const hpPerDay = hero.maxHp * 0.015 * 60 * 24;
+  // The worst simulation error actually observed is ~12x (Aeril: 4 HP predicted,
+  // 47 measured). A probe is only worth it when even being that wrong leaves the
+  // hero alive, so the margin uses the worst case, not the average.
+  const SIM_ERROR_MARGIN = 12;
   for (const r of rows) {
     const e = peek(r.key);
-    if (e && e.fights > 0 && e.hpCost) {
-      r.hpCostSimulated = r.hpCost;
+    const measured = !!(e && e.fights > 0);
+    // Keep the model's number under its own name before a measurement replaces it;
+    // the trust gate below has to compare against the simulation, always.
+    r.hpCostSimulated = r.hpCost;
+    if (measured && e.hpCost) {
       r.hpCost = e.hpCost;
       r.goldPerHp = +(r.gold / Math.max(1, r.hpCost)).toFixed(4);
+    }
+    if (measured) {
+      // A target that has never been won is not winnable, whatever the model
+      // says. It gets one fresh attempt after each level-up, when the stats that
+      // the model ignored have actually changed.
+      const retryAtNewLevel = e.wins === 0 && hero.level > (e.level || 0);
+      if (e.wins === 0 && !retryAtNewLevel) {
+        r.win = false;
+        r.blockedBy = `lost every measured fight (${e.fights})`;
+      } else if (e.wins === 0) {
+        r.win = r.win && r.level <= hero.level && r.hpCostSimulated * SIM_ERROR_MARGIN <= hero.maxHp;
+        r.blockedBy = r.win ? null : 'unproven above hero level';
+      }
+      r.trust = 'measured';
+    } else {
+      // Never fought: trust the model only where being wrong cannot be fatal.
+      const trivial = r.hpCostSimulated * SIM_ERROR_MARGIN <= hero.maxHp;
+      const atOrBelowLevel = r.level <= hero.level;
+      if (r.win && (!trivial || !atOrBelowLevel)) {
+        r.win = false;
+        r.blockedBy = !atOrBelowLevel ? 'outlevels the hero (untested)' : 'simulation not confident enough (untested)';
+      }
+      r.trust = 'simulated';
     }
     r.goldPerDay =
       r.win && r.hpCost > 0
