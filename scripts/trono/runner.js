@@ -20,15 +20,33 @@
  */
 const fs = require('fs');
 const path = require('path');
-const { Game, sleep } = require('./lib/game');
+const { Game, sleep, DEFAULT_PORT: CDP_PORT } = require('./lib/game');
 const { readHero, rankTargets, fight, combatCsrf, abandonCombat, ENCOUNTERS } = require('./lib/combat');
 const dailies = require('./lib/dailies');
 const talents = require('./lib/talents');
+const security = require('./lib/security');
+const session = require('./lib/session');
+const { GameHttp } = require('./lib/httptransport');
 
 const args = process.argv.slice(2);
 // The Agent Hub executes [runtime, script] with no arguments, so the live flag
 // and the loop interval can also arrive as environment variables.
 const LIVE = args.includes('--live') || process.env.TRONO_LIVE === '1';
+
+/**
+ * How the Hub asked for this agent to be launched.
+ *
+ *   browser : the tab owns the session and the loop (original behaviour)
+ *   hybrid  : the tab logs in, the loop runs over HTTP, the tab is closed
+ *   http    : HTTP only, from state/session.json; never opens a browser
+ *
+ * Default is browser: a missing variable must never change how production runs.
+ */
+const MODE = String(process.env.AGENT_LAUNCH_MODE || process.env.TRONO_MODE || 'browser').toLowerCase();
+if (!['browser', 'hybrid', 'http'].includes(MODE)) {
+  console.error(`unknown launch mode "${MODE}" — expected browser | hybrid | http`);
+  process.exit(2);
+}
 const loopArg = args.find((a) => a.startsWith('--loop='));
 const loopSeconds = loopArg
   ? parseInt(loopArg.split('=')[1], 10)
@@ -160,7 +178,10 @@ async function spendAttributePoints(g, hero, targets) {
     // Every attribute scored zero: no target is winnable at all. Damage is the
     // only thing that changes that and it does so before the simulation can see
     // it, so spend there rather than leaving the point idle.
-    const fallback = !pick || pick.goldPerDay <= 0;
+    // `choose` scores an attribute by the gold/day it unlocks at the next
+    // threshold (`gain`), not by a flat rate, so the zero test is on `gain`.
+    // Comparing `pick.goldPerDay` (undefined) silently disabled this fallback.
+    const fallback = !pick || pick.gain <= 0;
     const chosen = fallback ? 'strength' : pick.attr;
 
     const page = await g.fetchPage('/pages/overview.php');
@@ -178,7 +199,7 @@ async function spendAttributePoints(g, hero, targets) {
     if (measured) log(`attribute model: ${chosen} measured ${JSON.stringify(measured)}`);
     snapshot = (res.data && res.data.overview) || snapshot;
 
-    applied.push(`${chosen}${fallback ? '(fallback)' : `(${pick.goldPerDay}g/d)`}`);
+    applied.push(`${chosen}${fallback ? '(fallback)' : `(+${pick.gain}g/d at ${pick.pointsToNext}p)`}`);
     // Re-read instead of trusting the projection: the next point must be scored
     // against what the hero really is, not against what this loop expected.
     hero = await readHero(g);
@@ -403,29 +424,31 @@ async function tick(g, state) {
     return { rested: true };
   }
 
-  const buffer = Math.round(hero.maxHp * 0.12);
-  const affordable = targets.filter((t) => t.win && !t.coolingDown && t.hpCost + buffer <= hero.hp);
-  if (!affordable.length) {
-    const need = best.hpCost + buffer - hero.hp;
-    const perMin = Math.max(1, Math.round(hero.maxHp * 0.02));
-    log(`resting: need ${need} HP for ${best.name} (~${Math.ceil(need / perMin)} min at ${perMin} HP/min)`);
+  // Which tier deserves the next stamina point. The policy lives in lib/select
+  // so it can be tested on a grid of HP/stamina values without the browser.
+  const sel = selectPolicy.chooseFight(hero, targets, { maxFights });
+  const margin = sel.margin;
+  if (sel.action === 'wait') {
+    log(sel.reason);
     await restAtHospital(g);
     return { rested: true };
   }
+  const plan = sel.plan;
+  if (sel.notable) log(sel.reason);
 
   // 4. fight
   if (!LIVE) {
-    log(`dry run: would fight ${affordable.map((t) => `${t.name}(lv${t.level}, ${t.hpCost}HP/${t.exp}EXP)`).join(', ')}`);
+    log(`dry run: would fight ${plan.map((t) => `${t.name}(lv${t.level}, ${t.hpCost}HP/${t.exp}EXP)`).join(', ')}`);
     return { fought: 0, dry: true };
   }
 
   let fought = 0;
-  for (const target of affordable) {
+  for (const target of plan) {
     if (fought >= maxFights) break;
     const freshHero = await readHero(g);
     const fresh = learning.apply(rankTargets(freshHero), freshHero).find((t) => t.key === target.key);
     const now = freshHero;
-    if (!fresh || !fresh.win || fresh.coolingDown || fresh.hpCost + buffer > now.hp) break;
+    if (!fresh || !fresh.win || fresh.coolingDown || fresh.hpCost + margin > now.hp) break;
     if (now.stamina < target.stamina) {
       log(`stamina too low for ${target.name} (${now.stamina}/${target.stamina})`);
       break;
@@ -451,7 +474,7 @@ async function tick(g, state) {
       stamina: res.stamina,
       level: res.level
     });
-    learning.record(target.key, { hpCost: res.hpCost, won: !!res.won });
+    learning.record(target.key, { hpCost: res.hpCost, won: !!res.won, level: now.level });
     fought += 1;
     if (!res.won) break;
   }
@@ -463,62 +486,154 @@ async function tick(g, state) {
 const lock = require('./lib/driverlock');
 const learning = require('./lib/learning');
 const attributes = require('./lib/attributes');
+const selectPolicy = require('./lib/select');
 
-/** Reconnect the CDP session, then re-login if the game session is gone. */
+/** Login with bounded retries on an open tab. */
+async function loginWithRetries(g, attempts = 5) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const creds = require('./lib/credentials').load();
+    if (!creds) throw new Error('no credentials available');
+    const res = await g.login(creds).catch((e) => ({ ok: false, error: e.message }));
+    if (res.ok) {
+      log(`login ok (attempt ${attempt})`);
+      return true;
+    }
+    log(`login failed (attempt ${attempt}/${attempts}) — ${JSON.stringify(res).slice(0, 200)}`);
+    if (attempt < attempts) await sleep(20000 * attempt);
+  }
+  return false;
+}
+
+/**
+ * Connect to the browser, tolerating a launcher that is still coming up or a
+ * dying instance left behind by a hard kill.
+ */
+async function connectWithRetry(attempts = 3) {
+  let last = null;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await Game.connect({ spawn: true });
+    } catch (e) {
+      last = e;
+      log(`browser connect failed (${i}/${attempts}) — ${e.message}`);
+      if (i < attempts) await sleep(8000 * i);
+    }
+  }
+  throw last;
+}
+
+/**
+ * Why the browser stays open.
+ *
+ * The browser is the only thing that can authenticate, and the agent never
+ * decides on its own to close it. Handing the cookie off to HTTP is a transport
+ * change, not a licence to kill a window the user may be watching or using.
+ *
+ * Consequence, on purpose: the browser lives until the user closes it. To stop
+ * that from stacking one browser per restart, the Hub reuses a browser whose CDP
+ * port is already up instead of launching another one.
+ */
+const BROWSER_STAYS_OPEN =
+  'browser left open on purpose — it is yours to close; the agent keeps working over HTTP';
+
+/**
+ * Get a transport with a live session, honouring MODE.
+ *
+ * The browser is the only thing that can authenticate, so hybrid opens it even
+ * when a saved session exists but fails verification. It is closed again only
+ * after `session.verify` proved the exported cookie works from plain Node.
+ * That ordering is the whole safety property: no browser dies on a guess.
+ */
+async function acquire() {
+  if (MODE !== 'browser') {
+    const saved = session.load();
+    if (saved) {
+      const v = await session.verify(saved);
+      if (v.ok) {
+        // The Hub may have opened a browser before this run. Nobody needs it
+        // now, but closing it is not ours to decide: the browser belongs to the
+        // user. It is reused by the next restart (the Hub skips pre_launch when
+        // CDP is already listening), so it cannot pile up either.
+        log(
+          `http session from disk verified (${v.user} lv${v.level}, gold ${v.gold}, ${session.ageMinutes(saved)}m old) — ${BROWSER_STAYS_OPEN}`
+        );
+        return { g: new GameHttp(saved), via: 'http-saved' };
+      }
+      if (v.network) {
+        // The cookie may be perfect; the network is not. Let the caller retry
+        // with backoff instead of discarding a valid session and opening a
+        // browser over a transient blip.
+        throw new Error(`network while verifying the saved session (${v.error})`);
+      }
+      log(`saved http session rejected (${v.error}) — a browser login is needed`);
+      session.clear();
+    }
+    if (MODE === 'http') {
+      throw new Error('mode=http needs a verified state/session.json; run once in hybrid to create it');
+    }
+  }
+
+  const g = await connectWithRetry();
+  if (!(await g.isLoggedIn())) {
+    log('session dead at start, logging in');
+    if (!(await loginWithRetries(g))) throw new Error('autonomous login failed after retries');
+  }
+
+  if (MODE === 'browser') return { g, via: 'browser' };
+
+  // Hand off to HTTP. Proof before close, always.
+  const exported = await session.fromBrowser(g);
+  const check = await session.verify(exported);
+  if (!check.ok) {
+    // Keep the browser open: it is the only way back into the account.
+    log(`handoff REFUSED — cookie does not work outside the browser (${check.error}); staying on the browser`);
+    return { g, via: 'browser (handoff refused)' };
+  }
+  session.save(exported, { verified: true, goldAtHandoff: check.gold, hpAtHandoff: check.hp });
+
+  log(`handoff verified over HTTP (gold ${check.gold}, hp ${check.hp}) — ${BROWSER_STAYS_OPEN}`);
+
+  // Re-check with the browser still open. A handoff that only works once is not
+  // a handoff, and the browser is the only way back, so we stay on it.
+  const after = await session.verify(exported);
+  if (!after.ok) {
+    log(`handoff unstable (${after.error}) — staying on the browser`);
+    return { g, via: 'browser (handoff unstable)' };
+  }
+  return { g: new GameHttp(exported), via: 'http (browser open)' };
+}
+
+/** Rebuild the transport: reconnect, re-login, re-handoff in hybrid. */
 async function recover(g) {
   try {
     if (g) g.close();
   } catch (e) {}
-  const fresh = await Game.connect({ spawn: true });
-  if (await fresh.isLoggedIn()) return { g: fresh, action: 'reconnected' };
-  const creds = require('./lib/credentials').load();
-  if (!creds) throw new Error('no credentials available for recovery');
-  let lastError = null;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const res = await fresh.login(creds);
-      if (res.ok) return { g: fresh, action: 'relogged' };
-      lastError = new Error(`autonomous login rejected: ${JSON.stringify(res).slice(0, 200)}`);
-    } catch (e) {
-      lastError = e;
-    }
-    if (attempt < 3) await sleep(15000 * attempt);
-  }
-  throw lastError || new Error('autonomous login failed');
+  const acquired = await acquire();
+  return { g: acquired.g, action: acquired.via };
 }
 
 (async () => {
+  // A halt survives restarts on purpose: the Hub restarts this process, and a
+  // restart must not look like the human approving what was just detected.
+  const halt = security.readHalt();
+  if (halt) {
+    log(
+      `SECURITY HALT active — refusing to start. ${halt.where} at ${halt.at} :: ${(halt.signals || []).join(', ')}`
+    );
+    log(`human must clear: node tools/clear-halt.js --ack="<what you found>"`);
+    process.exit(3);
+  }
+
   const got = lock.acquire('runner');
   if (!got.ok) {
     log(`another driver is active (pid ${got.holder.pid}, ${got.holder.name}) — exiting`);
     process.exit(2);
   }
 
-  let g = await Game.connect({ spawn: true });
+  const acquired = await acquire();
+  let g = acquired.g;
+  log(`transport: ${acquired.via} (mode ${MODE})`);
   try {
-    // Startup login with bounded retries. A single transient failure
-    // (maintenance window, 401 race, CSRF glitch) used to exit(1) and force a
-    // manual login by the human.
-    const loginWithRetries = async (attempts = 5) => {
-      for (let attempt = 1; attempt <= attempts; attempt++) {
-        const creds = require('./lib/credentials').load();
-        if (!creds) throw new Error('no credentials available');
-        const res = await g.login(creds).catch((e) => ({ ok: false, error: e.message }));
-        if (res.ok) {
-          log(`login ok (attempt ${attempt})`);
-          return true;
-        }
-        log(`login failed (attempt ${attempt}/${attempts}) — ${JSON.stringify(res).slice(0, 200)}`);
-        if (attempt < attempts) await sleep(20000 * attempt);
-      }
-      return false;
-    };
-
-    if (!(await g.isLoggedIn())) {
-      log('session dead at start, logging in');
-      if (!(await loginWithRetries())) throw new Error('autonomous login failed after retries');
-    }
-
     let cfg = await g.idleConfig();
     let ticks = 0;
     let failures = 0;
@@ -532,13 +647,34 @@ async function recover(g) {
         }
         ticks += 1;
         await tick(g, { tick: ticks });
+        // Helpers deep in the tick catch their own errors and return "skip", so a
+        // halt detected there would otherwise be swallowed and the loop would
+        // keep poking the site. The file is the source of truth, not the throw.
+        if (security.isHalted()) {
+          const h = security.readHalt();
+          const err = new Error(`SECURITY HALT: ${(h.signals || []).join(', ')} in ${h.where}`);
+          err.code = 'SECURITY_HALT';
+          throw err;
+        }
         failures = 0;
       } catch (e) {
+        // Never recover from a detection: reconnect and relogin are exactly the
+        // repeated requests that turn a challenge into a ban.
+        if (e && e.code === 'SECURITY_HALT') {
+          log(`SECURITY HALT — stopping the agent. ${e.message}`);
+          throw e;
+        }
         failures += 1;
         log(`tick failed (${failures}) — ${e.message}`);
-        const fatal = /AUTH|session|unavailable|page error|Inspected target|Failed to fetch|WebSocket|ECONN/i.test(
-          `${e.code || ''} ${e.message}`
-        );
+        // An error that declares itself retryable is never a reason to rebuild the
+        // transport. Reopening a browser and logging in again cannot fix a socket,
+        // and the repeated-login path is exactly what marks an account. It still
+        // counts toward `failures`, so a network that is really down recovers.
+        const fatal =
+          !e.retryable &&
+          /AUTH|session|unavailable|page error|Inspected target|Failed to fetch|WebSocket|ECONN/i.test(
+            `${e.code || ''} ${e.message}`
+          );
         if (fatal || failures >= 3) {
           try {
             const r = await recover(g);
@@ -568,6 +704,11 @@ async function recover(g) {
     lock.release();
   }
 })().catch((e) => {
+  if (e && e.code === 'SECURITY_HALT') {
+    log(`ERROR SECURITY_HALT ${e.message}`);
+    lock.release();
+    process.exit(3);
+  }
   log(`ERROR ${e.code || ''} ${e.message}`);
   lock.release();
   process.exit(1);

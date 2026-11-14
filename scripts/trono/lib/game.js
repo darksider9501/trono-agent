@@ -17,6 +17,7 @@ const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
 const { CdpSession, sleep } = require('../../lib/cdp');
+const security = require('./security');
 
 const HOST = 'defiendeeltrono.com';
 const LAUNCHER = path.join('C:\\Users\\Dioneldis\\.cloakbrowser', 'launch-trono.ps1');
@@ -46,6 +47,32 @@ function httpGetJson(url, timeoutMs = 4000) {
     req.on('error', reject);
     req.setTimeout(timeoutMs, () => req.destroy(new Error(`timeout ${url}`)));
   });
+}
+
+/**
+ * Replay an in-page request that died at the socket.
+ *
+ * Same rule as the HTTP transport (lib/httptransport.js): `Failed to fetch`
+ * inside the page is a socket, not a policy, and replaying a read is free. When
+ * it still fails after both replays the error is marked retryable, because
+ * reopening a browser cannot fix a network that is down.
+ */
+const NET_RETRY_DELAYS = [400, 1200];
+const NET_ERROR = /Failed to fetch|NetworkError|net::ERR_|ERR_INTERNET_DISCONNECTED/i;
+
+async function withNetRetry(fn, { replayable = true } = {}) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (!replayable || !NET_ERROR.test(String((e && e.message) || ''))) throw e;
+      if (attempt >= NET_RETRY_DELAYS.length) {
+        e.retryable = true;
+        throw e;
+      }
+      await sleep(NET_RETRY_DELAYS[attempt]);
+    }
+  }
 }
 
 const PAGE_PARSE = `(html) => {
@@ -95,39 +122,109 @@ class Game {
   }
 
   static async connect(options = {}) {
+    // A halted agent must not even open a socket to the site. Checked before the
+    // CDP probe so the failure is the halt, not a mysterious connection error.
+    security.assertClear('Game.connect');
     const port = options.port || DEFAULT_PORT;
-    let targets;
-    try {
-      targets = await httpGetJson(`http://127.0.0.1:${port}/json/list`, 2500);
-    } catch (e) {
+    const listUrl = `http://127.0.0.1:${port}/json/list`;
+    let targets = null;
+
+    // The Hub's pre_launch starts the browser, and a Hub stop/start closes it, so
+    // a failed first probe usually means "starting right now", not "down".
+    // Spawning on that first failure is exactly what produced two game windows
+    // sharing one profile: the launcher was called while the real instance was
+    // still coming up. Wait for the window we were told to wait for.
+    const graceMs = options.graceMs === undefined ? 20000 : options.graceMs;
+    const graceDeadline = Date.now() + graceMs;
+    while (Date.now() < graceDeadline) {
+      try {
+        targets = await httpGetJson(listUrl, 2500);
+        break;
+      } catch (_) {
+        await sleep(1000);
+      }
+    }
+
+    if (!targets) {
       if (options.spawn === false) {
-        throw new Error(`CDP ${port} not reachable and spawn disabled (${e.message})`);
+        throw new Error(`CDP ${port} not reachable and spawn disabled`);
       }
       if (!fs.existsSync(LAUNCHER)) throw new Error(`missing launcher: ${LAUNCHER}`);
+      // Last check right before launching: the launcher itself refuses to start a
+      // second instance, but a stale port check is not enough on its own.
+      const deadline = Date.now() + 40000;
       execFileSync('powershell', ['-ExecutionPolicy', 'Bypass', '-File', LAUNCHER], { stdio: 'ignore' });
-      const deadline = Date.now() + 30000;
       while (Date.now() < deadline) {
         await sleep(1200);
         try {
-          targets = await httpGetJson(`http://127.0.0.1:${port}/json/list`, 2500);
+          targets = await httpGetJson(listUrl, 2500);
           break;
         } catch (_) {}
       }
-      if (!targets) throw new Error(`CDP ${port} did not come up within 30s`);
-      await sleep(3000);
-      targets = await httpGetJson(`http://127.0.0.1:${port}/json/list`, 2500);
+      if (!targets) throw new Error(`CDP ${port} did not come up within 40s`);
     }
 
-    const page = targets.find((t) => t.type === 'page' && (t.url || '').includes(HOST));
-    if (!page) {
+    const gamePages = targets.filter((t) => t.type === 'page' && (t.url || '').includes(HOST));
+    if (!gamePages.length) {
       throw new Error(
         `no ${HOST} tab on CDP ${port}; open targets: ${targets.map((t) => t.url).join(', ')}`
       );
     }
+    // A hard kill makes Chrome restore the previous session, so restarting used to
+    // leave two game tabs on screen. Keep one and close the rest: they share a
+    // session and only split attention.
+    for (const extra of gamePages.slice(1)) {
+      try {
+        await httpGetJson(`http://127.0.0.1:${port}/json/close/${extra.id}`, 1500);
+      } catch (_) {
+        // Losing the race against a tab that already closed itself is fine.
+      }
+    }
+    const page = gamePages[0];
     const session = new CdpSession(page.webSocketDebuggerUrl);
     await session.connect();
     await session.send('Runtime.enable');
-    return new Game(session, port);
+    const game = new Game(session, port);
+    // Never hand back a tab that cannot resolve a relative URL.
+    await game.waitForDocument();
+    // Baseline cookie check. A vendor cookie already parked in the profile means
+    // a layer exists (or existed) — better to report it than to play through it.
+    try {
+      const cookieString = await game.evalInPage('document.cookie', 8000);
+      security.inspectCookies(cookieString, 'connect: document.cookie');
+    } catch (e) {
+      if (e && e.code === 'SECURITY_HALT') throw e;
+      // The tab may be mid-navigation; every request still gets inspected.
+    }
+    return game;
+  }
+
+  /**
+   * Wait until the tab's *document* is really the game.
+   *
+   * A CDP target can already advertise the game URL while its document is still
+   * `about:blank` (fresh spawn, or a restored tab mid-commit). Any relative
+   * fetch then dies with "Failed to parse URL from /", which looked like a
+   * session bug the first time it happened.
+   */
+  async waitForDocument(timeoutMs = 25000) {
+    const deadline = Date.now() + timeoutMs;
+    let navigated = false;
+    while (Date.now() < deadline) {
+      let info = null;
+      try {
+        info = await this.evalInPage('({href: location.href, ready: document.readyState})', 5000);
+      } catch (_) {}
+      if (info && info.href && info.href.includes(HOST)) return true;
+      if (!navigated) {
+        try {
+          await this.session.send('Page.navigate', { url: `https://${HOST}/` }, 10000);
+          navigated = true;
+        } catch (_) {}
+      }
+      await sleep(1000);
+    }
+    throw new Error(`tab never landed on ${HOST}`);
   }
 
   async evalInPage(expression, timeoutMs = 30000) {
@@ -143,6 +240,21 @@ class Game {
     return res.result.value;
   }
 
+  /**
+   * Ask the browser to exit.
+   *
+   * Only ever called after the exported session was proven over plain HTTP
+   * (lib/session.js `verify`). If that proof fails the browser stays open: it is
+   * the only way back into the account.
+   */
+  async closeBrowser() {
+    try {
+      await this.session.send('Browser.close', {}, 5000);
+    } catch (_) {
+      // The socket dies with the browser; that is the expected outcome.
+    }
+  }
+
   close() {
     try {
       this.session.close();
@@ -152,12 +264,19 @@ class Game {
   /** Fetch a game page from inside the tab and parse it. */
   async fetchPage(pagePath) {
     const url = pagePath.startsWith('http') ? pagePath : `https://${HOST}${pagePath}`;
+    security.assertClear(`fetchPage ${pagePath}`);
     // X-Game-View is mandatory: without it the server returns the public landing
     // page (~10.9 KB) even when the session is valid, instead of the game view.
-    const raw = await this.evalInPage(`(async () => {
+    const raw = await withNetRetry(() =>
+      this.evalInPage(`(async () => {
       const r = await fetch(${JSON.stringify(url)}, { credentials: 'same-origin', cache: 'no-store', headers: { 'X-Game-View': '1' } });
       return { ok: r.ok, status: r.status, html: await r.text() };
-    })()`);
+    })()`)
+    );
+    // Inspect before deciding anything: a 403 or an interstitial here is the
+    // first thing an added anti-bot layer would show, and it must stop the agent
+    // rather than be treated as a transient page error to retry.
+    security.inspect({ where: `fetchPage ${pagePath}`, url, status: raw && raw.status, text: (raw && raw.html) || '' });
     if (!raw || !raw.ok) {
       return { ok: false, status: raw && raw.status, url, html: '', text: '', csrf: [], forms: [], apis: [] };
     }
@@ -174,21 +293,34 @@ class Game {
   }
 
   async apiGet(apiPath) {
-    const r = await this.evalInPage(`(async () => {
-      const r = await fetch(${JSON.stringify(apiPath)}, { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' } });
-      const t = await r.text();
-      let j = null; try { j = JSON.parse(t); } catch (e) {}
-      return { status: r.status, json: j, raw: j ? null : t.slice(0, 400) };
-    })()`);
-    if (!r) throw new Error(`empty response from ${apiPath}`);
-    if (r.status === 401 || r.status === 403) throw new Error(`AUTH: ${apiPath} -> ${r.status}`);
-    if (!r.json) return { ok: false, status: r.status, raw: r.raw };
-    return r.json;
+    for (let attempt = 0; ; attempt += 1) {
+      security.assertClear(`apiGet ${apiPath}`);
+      const r = await withNetRetry(() =>
+        this.evalInPage(`(async () => {
+        const r = await fetch(${JSON.stringify(apiPath)}, { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' } });
+        const t = await r.text();
+        let j = null; try { j = JSON.parse(t); } catch (e) {}
+        return { status: r.status, json: j, raw: j ? null : t.slice(0, 400), sample: t.slice(0, 2000) };
+      })()`)
+      );
+      if (!r) throw new Error(`empty response from ${apiPath}`);
+      security.inspect({ where: `apiGet ${apiPath}`, url: apiPath, status: r.status, text: r.sample || r.raw || '' });
+      if (r.status === 401 || r.status === 403) throw new Error(`AUTH: ${apiPath} -> ${r.status}`);
+      if (r.json) return r.json;
+      // 2xx with a non-JSON body: partial answer, not a state. See httptransport.
+      const worthReplaying = r.status === 200 || r.status >= 500;
+      if (worthReplaying && attempt < NET_RETRY_DELAYS.length) {
+        await sleep(NET_RETRY_DELAYS[attempt]);
+        continue;
+      }
+      return { ok: false, status: r.status, raw: r.raw };
+    }
   }
 
   async apiPost(apiPath, payload = {}, opts = {}) {
     if (!opts.allowMutate) throw new MutationBlocked(`POST ${apiPath}`);
     if (!opts.csrf) throw new Error('apiPost needs opts.csrf (use csrfFor(pagePath))');
+    security.assertClear(`apiPost ${apiPath}`);
     const r = await this.evalInPage(`(async () => {
       const r = await fetch(${JSON.stringify(apiPath)}, {
         method: 'POST',
@@ -198,13 +330,20 @@ class Game {
       });
       const t = await r.text();
       let j = null; try { j = JSON.parse(t); } catch (e) {}
-      return { status: r.status, json: j, raw: j ? null : t.slice(0, 400) };
+      return { status: r.status, json: j, raw: j ? null : t.slice(0, 400), sample: t.slice(0, 2000) };
     })()`);
+    security.inspect({
+      where: `apiPost ${apiPath}`,
+      url: apiPath,
+      status: r && r.status,
+      text: (r && (r.sample || r.raw)) || ''
+    });
     return (r && r.json) || { ok: false, status: r && r.status, raw: r && r.raw };
   }
 
   async postForm(actionPath, fields = {}, opts = {}) {
     if (!opts.allowMutate) throw new MutationBlocked(`FORM ${actionPath}`);
+    security.assertClear(`postForm ${actionPath}`);
     const body = Object.entries(fields)
       .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
       .join('&');
@@ -216,8 +355,15 @@ class Game {
         body: ${JSON.stringify(body)}
       });
       const t = await r.text();
-      return { status: r.status, redirected: r.redirected, finalUrl: r.url, len: t.length };
+      return { status: r.status, redirected: r.redirected, finalUrl: r.url, len: t.length, sample: t.slice(0, 2000) };
     })()`);
+    security.inspect({
+      where: `postForm ${actionPath}`,
+      url: actionPath,
+      status: r && r.status,
+      text: (r && r.sample) || ''
+    });
+    if (r) delete r.sample;
     return r;
   }
 
@@ -227,10 +373,25 @@ class Game {
    * (session-idle.js ignores synthetic events), so a bot must renew explicitly.
    */
   async idleConfig() {
-    const page = await this.fetchPage('/pages/overview.php');
+    let page = await this.fetchPage('/pages/overview.php');
     if (!page.ok) throw new Error(`cannot read overview.php (HTTP ${page.status})`);
-    const m = page.html.match(/id="sessionIdleConfig"[^>]*>([\s\S]*?)<\/script>/);
-    if (!m) throw new Error('sessionIdleConfig not found — not logged in?');
+    let m = page.html.match(/id="sessionIdleConfig"[^>]*>([\s\S]*?)<\/script>/);
+    if (!m) {
+      // Same distinction the HTTP transport makes: a cut-off render of a page
+      // that clearly IS the game is transient, a page with no game shell at all
+      // is a genuine logged-out page. Only the first deserves a second look.
+      if (!/gameSidebar/i.test(page.html)) {
+        throw new Error('sessionIdleConfig not found — not logged in?');
+      }
+      await sleep(1500);
+      page = await this.fetchPage('/pages/overview.php');
+      m = page.ok ? page.html.match(/id="sessionIdleConfig"[^>]*>([\s\S]*?)<\/script>/) : null;
+      if (!m) {
+        const err = new Error('sessionIdleConfig missing from a rendered game page (partial page)');
+        err.retryable = true;
+        throw err;
+      }
+    }
     return JSON.parse(m[1]);
   }
 
@@ -240,13 +401,17 @@ class Game {
    * is already dead; a healthy session is left untouched.
    */
   async login({ username, password, remember = true }) {
+    security.assertClear('login');
     const probe = await this.evalInPage(`(async () => {
       const r = await fetch('/', { credentials: 'same-origin', cache: 'no-store' });
       const h = await r.text();
       const d = new DOMParser().parseFromString(h, 'text/html');
       const c = d.querySelector('input[name="csrf"]');
-      return { status: r.status, csrf: c && c.value, hasGame: h.includes('sessionIdleConfig') };
+      return { status: r.status, csrf: c && c.value, hasGame: h.includes('sessionIdleConfig'), sample: h.slice(0, 2000) };
     })()`);
+    // A login page that turns into a captcha is the one place this must stop
+    // cold: retrying an authentication challenge is what marks the account.
+    security.inspect({ where: 'login probe', url: '/', status: probe && probe.status, text: (probe && probe.sample) || '' });
     if (probe.hasGame) return { ok: true, skipped: 'session_already_active' };
     if (!probe.csrf) return { ok: false, error: 'no csrf on landing page' };
 
@@ -270,9 +435,12 @@ class Game {
         status: r.status,
         finalUrl: r.url,
         len: h.length,
-        looksLoggedIn: h.includes('sessionIdleConfig') || h.includes('gameSidebar')
+        looksLoggedIn: h.includes('sessionIdleConfig') || h.includes('gameSidebar'),
+        sample: h.slice(0, 2000)
       };
     })()`);
+    security.inspect({ where: 'login post', url: '/', status: res && res.status, text: (res && res.sample) || '' });
+    if (res) delete res.sample;
 
     const alive = await this.isLoggedIn();
     return { ok: alive, ...res };
@@ -280,6 +448,7 @@ class Game {
 
   /** Renew the session the same way the game client does for a real player. */
   async heartbeat(cfg) {
+    security.assertClear('heartbeat');
     const body = new URLSearchParams({
       action: 'activity',
       csrf: cfg.csrf,
@@ -295,8 +464,14 @@ class Game {
       });
       const t = await r.text();
       let j = null; try { j = JSON.parse(t); } catch (e) {}
-      return { status: r.status, json: j, raw: j ? null : t.slice(0, 200) };
+      return { status: r.status, json: j, raw: j ? null : t.slice(0, 200), sample: t.slice(0, 2000) };
     })()`);
+    security.inspect({
+      where: 'heartbeat',
+      url: cfg && cfg.endpoint,
+      status: r && r.status,
+      text: (r && (r.sample || r.raw)) || ''
+    });
     const alive = r && r.status === 200 && (!r.json || r.json.ok !== false);
     return { alive, status: r && r.status, response: r && (r.json || r.raw) };
   }
