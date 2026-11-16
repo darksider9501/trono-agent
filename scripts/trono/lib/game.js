@@ -341,6 +341,39 @@ class Game {
     return (r && r.json) || { ok: false, status: r && r.status, raw: r && r.raw };
   }
 
+  /**
+   * A form POST whose answer is JSON we must read: the talent board answers
+   * `{ok, message, model}` and a 200 carrying `ok:false` is a rejection, not success.
+   */
+  async postFormJson(actionPath, fields = {}, opts = {}) {
+    if (!opts.allowMutate) throw new MutationBlocked(`FORM ${actionPath}`);
+    security.assertClear(`postFormJson ${actionPath}`);
+    const body = Object.entries(fields)
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .join('&');
+    const r = await this.evalInPage(`(async () => {
+      const r = await fetch(${JSON.stringify(actionPath)}, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+        body: ${JSON.stringify(body)}
+      });
+      const t = await r.text();
+      let json = null;
+      try { json = JSON.parse(t); } catch (_) {}
+      return { status: r.status, json, sample: json ? '' : t.slice(0, 400) };
+    })()`);
+    security.inspect({
+      where: `postFormJson ${actionPath}`,
+      url: actionPath,
+      status: r && r.status,
+      text: (r && r.sample) || ''
+    });
+    if (!r) return { ok: false, status: 0, raw: 'no answer from page' };
+    if (r.json) return { ...r.json, status: r.status };
+    return { ok: false, status: r.status, raw: r.sample };
+  }
+
   async postForm(actionPath, fields = {}, opts = {}) {
     if (!opts.allowMutate) throw new MutationBlocked(`FORM ${actionPath}`);
     security.assertClear(`postForm ${actionPath}`);

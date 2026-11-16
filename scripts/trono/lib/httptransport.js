@@ -257,6 +257,37 @@ class GameHttp {
     return { status: r.status, redirected: r.url !== absolute(actionPath), finalUrl: r.url, len: r.text.length };
   }
 
+  /**
+   * A form POST whose answer is JSON, and whose answer we must READ.
+   *
+   * `postForm` above drops the body, which is fine for the legacy actions that
+   * answer with a redirect. The talent board (v3, 2026-11-16) answers
+   * `{ok, message, model}` and the caller needs both the verdict and the new
+   * ranks: a 200 carrying `ok:false` is a rejection, not a success. Retry rules
+   * are unchanged — this still goes through `_fetch`, so a mutation is only
+   * replayed when the request provably never left.
+   */
+  async postFormJson(actionPath, fields = {}, opts = {}) {
+    if (!opts.allowMutate) throw new Error(`MUTATION_BLOCKED: FORM ${actionPath} requires { allowMutate: true }`);
+    const body = Object.entries(fields)
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .join('&');
+    const r = await this._fetch(actionPath, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        accept: 'application/json'
+      },
+      body
+    });
+    let json = null;
+    try {
+      json = JSON.parse(r.text);
+    } catch (_) {}
+    if (!json) return { ok: false, status: r.status, raw: r.text.slice(0, 400) };
+    return { ...json, status: r.status };
+  }
+
   async idleConfig() {
     let page = await this.fetchPage('/pages/overview.php');
     if (!page.ok) throw new Error(`cannot read overview.php (HTTP ${page.status})`);

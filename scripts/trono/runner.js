@@ -417,7 +417,12 @@ async function tick(g, state) {
   try {
     const tal = await talents.spendAll(g, { allowMutate: LIVE });
     if (tal.done || (tal.reason && tal.reason !== 'no talent points')) {
-      log(`talents: ${tal.done ? 'OK' : 'skip'} — ${tal.done ? JSON.stringify(tal.applied) : tal.reason}`);
+      // Sixteen points is sixteen objects: log the tally, not the transcript.
+      const tally = {};
+      for (const a of tal.applied || []) tally[a.key] = (tally[a.key] || 0) + 1;
+      const summary = Object.entries(tally).map(([k, n]) => `${k}x${n}`).join(', ');
+      const left = typeof tal.pointsLeft === 'number' ? ` left ${tal.pointsLeft}` : '';
+      log(`talents: ${tal.done ? 'OK' : 'skip'} ${tal.done ? `${(tal.applied || []).length} spent (${summary})${left}` : tal.reason}`);
     }
   } catch (e) {
     log(`talents failed: ${e.message}`);
