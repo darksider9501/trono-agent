@@ -93,11 +93,31 @@ const STATUS_SIGNALS = {
  * The game's own maintenance flag, which is the one 503 that is not a gate.
  *
  * `"maintenance":true` is unambiguous: no bot-management layer writes our JSON.
- * The prose variant only counts on an error status, so a page that happens to
- * mention maintenance in its UI copy can never make the agent sit and wait.
  */
 const MAINTENANCE_JSON = /"maintenance"\s*:\s*true/i;
-const MAINTENANCE_TEXT = /en mantenimiento|under maintenance|scheduled maintenance/i;
+
+/**
+ * A whole page that IS the maintenance notice.
+ *
+ * Second real shape, 2026-11-15 -- it got past the previous regex and halted the
+ * farm for a day:
+ *   <title>Mantenimiento — Defiende el Trono</title>
+ *   <h2>Mantenimiento en curso</h2>
+ *   <p>Estamos mejorando el rendimiento del juego...</p>
+ * A document whose own title or top-level heading announces maintenance, and
+ * which has no game shell in it, cannot be mistaken for anything else.
+ */
+const MAINTENANCE_PAGE = /<title[^>]*>[^<]*\bmantenimiento\b|<h[12][^>]*>\s*mantenimiento\b/i;
+
+/** Any real game page carries the sidebar; the maintenance notice never does. */
+const GAME_SHELL = /gameSidebar/i;
+
+/**
+ * Prose mentions, only trusted on a 5xx: that is the server itself saying it is
+ * down. On a 4xx the same word can be part of a challenge page, and the STRONG
+ * markers above already claim those.
+ */
+const MAINTENANCE_TEXT = /\bmantenimiento\b|\bmaintenance\b/i;
 
 /** Cookie names set by bot-management vendors. A new one is a new layer. */
 const BOT_COOKIE = /^(__cf|cf_clearance|_px|_pxhd|datadome|dd_|_abck|ak_bmsc|bm_sz|incap_ses|visid_incap)/i;
@@ -213,7 +233,12 @@ function inspect({ where, url, status, text, headers }) {
     throw new SecurityHalt(`SECURITY_HALT: ${where} returned ${[...new Set(strong)].join(', ')}`, record);
   }
 
-  if (MAINTENANCE_JSON.test(body) || (isError && MAINTENANCE_TEXT.test(body))) {
+  const serverDown = typeof status === 'number' && status >= 500;
+  if (
+    MAINTENANCE_JSON.test(body) ||
+    (MAINTENANCE_PAGE.test(body) && !GAME_SHELL.test(body)) ||
+    (serverDown && MAINTENANCE_TEXT.test(body))
+  ) {
     throw new MaintenanceWindow(
       `MAINTENANCE: ${where} returned ${status || 'no status'} — the game is down on its own schedule`,
       { where, status }

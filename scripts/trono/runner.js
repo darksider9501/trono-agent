@@ -55,9 +55,11 @@ const loopSeconds = loopArg
 // How long to wait when the game says it is in maintenance. Waiting IS the
 // correct response: nothing here is a detection, and reopening a browser or
 // logging in again during a maintenance window is exactly the pointless,
-// repeated-authentication pattern the breaker exists to avoid. One cheap request
-// every five minutes also notices the moment the window ends.
+// repeated-authentication pattern the breaker exists to avoid. The wait doubles
+// up to half an hour, because the real windows have lasted hours (2026-11-15:
+// ~19 h): a fixed 5-minute poll would mean ~230 requests for nothing.
 const MAINTENANCE_WAIT_MS = 5 * 60 * 1000;
+const MAINTENANCE_WAIT_MAX_MS = 30 * 60 * 1000;
 
 // Verified in the economy page: 10,000 gold buys 1 DOTIRIA and 1 DOTIRIA pays 1
 // USDT (`data-unit="10000" data-reward="1"`). The first withdrawal allows 10-15
@@ -645,6 +647,7 @@ async function recover(g) {
     let ticks = 0;
     let failures = 0;
     let recoverFailures = 0;
+    let maintenanceWaits = 0;
 
     for (;;) {
       try {
@@ -664,6 +667,7 @@ async function recover(g) {
           throw err;
         }
         failures = 0;
+        maintenanceWaits = 0;
       } catch (e) {
         // Never recover from a detection: reconnect and relogin are exactly the
         // repeated requests that turn a challenge into a ban.
@@ -675,8 +679,10 @@ async function recover(g) {
         // would trigger recover() on the third one) and it must never look like a
         // detection, so it just waits and tries again.
         if (e && e.code === 'MAINTENANCE') {
-          log(`maintenance window — ${e.message}. waiting ${MAINTENANCE_WAIT_MS / 60000} min`);
-          await sleep(MAINTENANCE_WAIT_MS);
+          const wait = Math.min(MAINTENANCE_WAIT_MAX_MS, MAINTENANCE_WAIT_MS * 2 ** maintenanceWaits);
+          maintenanceWaits += 1;
+          log(`maintenance window (#${maintenanceWaits}) — ${e.message}. waiting ${wait / 60000} min`);
+          await sleep(wait);
           continue;
         }
         failures += 1;
