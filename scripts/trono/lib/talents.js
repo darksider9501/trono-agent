@@ -131,10 +131,23 @@ function parseActionUrl(html) {
   return /^\/actions\/[a-z0-9_]+\.php$/.test(path) ? path : DEFAULT_ACTION_URL;
 }
 
-/** Available points, straight from the board's own budget counter. */
+/**
+ * Available points.
+ *
+ * `budget` is the LIFETIME budget, not the balance: on 2026-11-16 the board read
+ * `budget:16` both before the first point was spent and after all sixteen were (ranks
+ * summed to 16). Spending the header's "Puntos disponibles 16" as a balance meant the
+ * loop believed it always had points and logged a skip every single tick.
+ */
+function availablePoints(board) {
+  if (!board) return 0;
+  const spent = Object.values(board.ranks || {}).reduce((n, r) => n + Number(r || 0), 0);
+  return Math.max(0, Number(board.budget || 0) - spent);
+}
+
+/** Available points, straight from the board's own budget counter minus what is spent. */
 function parsePoints(html) {
-  const board = parseBoard(html);
-  return board ? Number(board.budget) : 0;
+  return availablePoints(parseBoard(html));
 }
 
 /** Kept for callers that only want the node list. */
@@ -154,7 +167,7 @@ async function read(g) {
     hero: board ? board.hero : null,
     actionUrl: parseActionUrl(page.html),
     mode: board ? board.mode : null,
-    points: board ? Number(board.budget) : 0,
+    points: availablePoints(board),
     board,
     nodes,
     ready: nodes.filter((n) => n.canUpgrade && n.rank < n.max)
@@ -231,7 +244,7 @@ async function spendAll(g, opts = {}) {
     state = {
       ...state,
       hero: model.hero,
-      points: Number(model.budget),
+      points: availablePoints(model),
       board: model,
       nodes: nodesOf(model),
       ready: nodesOf(model).filter((n) => n.canUpgrade && n.rank < n.max)
@@ -241,4 +254,4 @@ async function spendAll(g, opts = {}) {
   return { done: applied.length > 0, applied, pointsLeft: state.points };
 }
 
-module.exports = { PAGE, DEFAULT_ACTION_URL, read, spendAll, choose, parseBoard, parseNodes, parsePoints, parseCsrf, parseActionUrl };
+module.exports = { PAGE, DEFAULT_ACTION_URL, read, spendAll, choose, parseBoard, parseNodes, parsePoints, parseCsrf, parseActionUrl, availablePoints };

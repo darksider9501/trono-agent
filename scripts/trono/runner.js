@@ -24,6 +24,7 @@ const { Game, sleep, DEFAULT_PORT: CDP_PORT } = require('./lib/game');
 const { readHero, rankTargets, fight, combatCsrf, abandonCombat, ENCOUNTERS } = require('./lib/combat');
 const dailies = require('./lib/dailies');
 const talents = require('./lib/talents');
+const craft = require('./lib/craft');
 const security = require('./lib/security');
 const session = require('./lib/session');
 const { GameHttp } = require('./lib/httptransport');
@@ -51,6 +52,18 @@ const loopArg = args.find((a) => a.startsWith('--loop='));
 const loopSeconds = loopArg
   ? parseInt(loopArg.split('=')[1], 10)
   : parseInt(process.env.TRONO_LOOP || '0', 10) || 0;
+
+/**
+ * Potion crafting spends gold, and gold is human territory.
+ *
+ * The cap is an explicit environment variable that defaults to 0, which keeps the whole
+ * module off: the agent reads the smithy, works out what the dailies would cost, and
+ * posts nothing. Turning it on is a one-line, human-made decision.
+ */
+const CRAFT_MAX_GOLD = Math.max(0, parseInt(process.env.TRONO_CRAFT_MAX_GOLD || '0', 10) || 0);
+
+/** Last craft skip reason, so a stable shortage is logged once instead of every tick. */
+let lastCraftReason = null;
 
 // How long to wait when the game says it is in maintenance. Waiting IS the
 // correct response: nothing here is a detection, and reopening a browser or
@@ -408,6 +421,26 @@ async function tick(g, state) {
 
   // 2b. daily quests: accept first (progress only counts after accepting), then claim
   await handleDailies(g);
+
+  // 2c. the potions the dailies ask for, inside the gold cap a human set
+  try {
+    const made = await craft.craft(g, { maxGold: CRAFT_MAX_GOLD, allowMutate: LIVE });
+    if (made.done) {
+      const items = made.crafted.map((c) => `${c.quantity} x ${c.name}`).join(', ');
+      log(`craft: OK ${items} for ${made.goldSpent} gold (${made.crafted[0].goldBefore} -> ${made.gold})`);
+      lastCraftReason = null;
+    } else if (made.dry) {
+      log(`craft: dry - would make ${made.quantity} x ${made.planned} with ${made.gold} gold on hand`);
+      lastCraftReason = made.reason || null;
+    } else if (made.reason) {
+      // Materials arrive slowly, so the same shortage repeats every tick. Say it once,
+      // and again only when the reason changes.
+      if (made.reason !== lastCraftReason) log(`craft: skip - ${made.reason}`);
+      lastCraftReason = made.reason;
+    }
+  } catch (e) {
+    log(`craft failed: ${e.message}`);
+  }
 
   // 3. spend what the game granted
   const attr = await spendAttributePoints(g, hero, targets);  if (attr.done || attr.reason !== 'no points') log(`attributes: ${attr.done ? 'OK' : 'skip'} — ${attr.reason}`);

@@ -160,7 +160,8 @@ function fakeServer(model, opts = {}) {
       const n = state.branches.flatMap((b) => b.nodes).find((x) => x.talent_key === fields.talent_key);
       if (!n || !n.can_upgrade || state.budget <= 0) return { ok: false, status: 200, message: 'No disponible.' };
       state.ranks[n.id] = Number(state.ranks[n.id] || 0) + 1;
-      state.budget -= 1;
+      // `budget` is the LIFETIME budget and the server does not decrement it: the live
+      // board read budget=16 both before spending and after all 16 points were spent.
       recompute();
       return { ok: true, status: 200, message: 'ok', model: JSON.parse(JSON.stringify(state)) };
     }
@@ -201,6 +202,19 @@ function fakeServer(model, opts = {}) {
     check('never touches a level-gated node', !order.some((k) => k.endsWith('_mid')), order.filter((k) => k.endsWith('_mid')).join(','));
     check('posts the four form fields', g.posts.every((p) => p.csrf === CSRF && p.hero === 'inferno' && p.action === 'upgrade' && p.talent_key), '');
     check('posts to the action url', g.posts.every((p) => p.url === '/actions/talent_board.php'), g.posts[0].url);
+  }
+
+  // --- spent budget is not available budget -------------------------------
+  {
+    const spent = board();
+    spent.ranks = Object.fromEntries(Object.keys(spent.ranks).map((k) => [k, 0]));
+    spent.ranks.offense_root = 5;
+    spent.ranks.defense_root = 5;
+    spent.ranks.utility_root = 5;
+    spent.ranks.offense_left = 1;
+    const out = await talents.spendAll(fakeServer(spent), { allowMutate: true });
+    check('budget minus ranks is the balance', talents.availablePoints(spent) === 0, `available=${talents.availablePoints(spent)}`);
+    check('a spent board is silent, not a skip per tick', /no talent points/.test(out.reason || ''), out.reason);
   }
 
   // --- levels gate the plan, not the loop ----------------------------------

@@ -276,7 +276,8 @@ class GameHttp {
       method: 'POST',
       headers: {
         'content-type': 'application/x-www-form-urlencoded',
-        accept: 'application/json'
+        accept: 'application/json',
+        ...(opts.headers || {})
       },
       body
     });
