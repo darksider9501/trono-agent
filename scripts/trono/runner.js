@@ -25,6 +25,7 @@ const { readHero, rankTargets, fight, combatCsrf, abandonCombat, ENCOUNTERS } = 
 const dailies = require('./lib/dailies');
 const talents = require('./lib/talents');
 const craft = require('./lib/craft');
+const chests = require('./lib/chests');
 const security = require('./lib/security');
 const session = require('./lib/session');
 const { GameHttp } = require('./lib/httptransport');
@@ -62,8 +63,21 @@ const loopSeconds = loopArg
  */
 const CRAFT_MAX_GOLD = Math.max(0, parseInt(process.env.TRONO_CRAFT_MAX_GOLD || '0', 10) || 0);
 
+/**
+ * How many encounter chests to open per tick.
+ *
+ * Chests are free to open and they are the only source of the crafting materials, so the
+ * ceiling is not a safety gate on spending — it is a pace control. The inventory was
+ * carrying 38 of them on 2026-11-17; the controller's own batch size is 20, so one batch
+ * per tick clears the backlog in two ticks without a 38-request burst.
+ */
+const CHESTS_PER_TICK = Math.max(0, parseInt(process.env.TRONO_CHESTS_PER_TICK || '20', 10) || 0);
+
 /** Last craft skip reason, so a stable shortage is logged once instead of every tick. */
 let lastCraftReason = null;
+
+/** Last chest skip reason, same idea. */
+let lastChestReason = null;
 
 // How long to wait when the game says it is in maintenance. Waiting IS the
 // correct response: nothing here is a detection, and reopening a browser or
@@ -320,13 +334,22 @@ async function restAtHospital(g) {
   return { done: (res && res.status) === 200, reason: 'resting at hospital' };
 }
 
-/** Daily quests: accept what combat can finish, then claim whatever is ready. */
-async function handleDailies(g) {
-  let accepted = [];
+/**
+ * Daily quests, part 1: accept what the agent can actually finish.
+ *
+ * Progress is only counted after an offer is accepted, so this has to run BEFORE the
+ * steps that make progress (chests, crafting) or every tick spends its work on an
+ * objective that is not listening.
+ *
+ * `Fabrica` used to be skipped here because there was no crafting module; `lib/craft.js`
+ * now covers potions, so the offer is taken. `Gasta|Mejora|Compra` stay: those spend gold
+ * on things a human has to authorise.
+ */
+async function acceptDailies(g) {
+  const accepted = [];
   try {
     const o = await dailies.offers(g);
-    // Skip offers that require spending gold/materials or crafting we cannot sustain yet.
-    const SKIP = /Fabrica|Gasta|Mejora|Compra/i;
+    const SKIP = /Gasta|Mejora|Compra/i;
     const wanted = o.list.filter((x) => !SKIP.test(x.text));
     if (LIVE) {
       for (const offer of wanted) {
@@ -338,7 +361,12 @@ async function handleDailies(g) {
   } catch (e) {
     log(`dailies accept failed: ${e.message}`);
   }
+  if (accepted.length) log(`dailies accepted: ${accepted.map((a) => a.title || a.id).join(', ')}`);
+  return accepted;
+}
 
+/** Daily quests, part 2: claim whatever is ready. Runs after the work, not before it. */
+async function claimDailies(g) {
   let claimed = [];
   try {
     const r = await dailies.claimAll(g, { allowMutate: LIVE });
@@ -346,10 +374,8 @@ async function handleDailies(g) {
   } catch (e) {
     log(`dailies claim failed: ${e.message}`);
   }
-
-  if (accepted.length) log(`dailies accepted: ${accepted.map((a) => a.title || a.id).join(', ')}`);
   if (claimed.length) log(`dailies claimed: ${JSON.stringify(claimed)}`);
-  return { accepted, claimed };
+  return claimed;
 }
 
 /**
@@ -419,10 +445,32 @@ async function tick(g, state) {
     }
   }
 
-  // 2b. daily quests: accept first (progress only counts after accepting), then claim
-  await handleDailies(g);
+  // 2b. daily quests: accept first. Progress only counts after accepting, so the two
+  //     steps below (chests, crafting) would move nothing if this ran after them.
+  await acceptDailies(g);
 
-  // 2c. the potions the dailies ask for, inside the gold cap a human set
+  // 2c. the encounter chests. They are the only source of the crafting materials, and
+  //     two dailies of their own: "Abre 5 cofres de botín" and "Reúne 10 materiales".
+  try {
+    const out = await chests.openAll(g, { maxPerTick: CHESTS_PER_TICK, allowMutate: LIVE });
+    if (out.done) {
+      const mats = Object.entries(out.materials || {}).map(([k, v]) => `${k} +${v}`).join(', ');
+      const extra = out.gold ? ` (+${out.gold} gold)` : '';
+      log(`chests: OK ${out.opened} opened (${out.waiting} left)${mats ? ' -> ' + mats : ''}${extra}`);
+      lastChestReason = null;
+    } else if (out.dry) {
+      log(`chests: dry - would open ${out.planned} of ${out.available}`);
+      lastChestReason = out.reason || null;
+    } else if (out.reason) {
+      // "no chests to open" repeats every tick once the shelf is empty; say it once.
+      if (out.reason !== lastChestReason) log(`chests: skip - ${out.reason}`);
+      lastChestReason = out.reason;
+    }
+  } catch (e) {
+    log(`chests failed: ${e.message}`);
+  }
+
+  // 2d. the potions the dailies ask for, inside the gold cap a human set
   try {
     const made = await craft.craft(g, { maxGold: CRAFT_MAX_GOLD, allowMutate: LIVE });
     if (made.done) {
@@ -441,6 +489,9 @@ async function tick(g, state) {
   } catch (e) {
     log(`craft failed: ${e.message}`);
   }
+
+  // 2e. claim whatever the work above just finished
+  await claimDailies(g);
 
   // 3. spend what the game granted
   const attr = await spendAttributePoints(g, hero, targets);  if (attr.done || attr.reason !== 'no points') log(`attributes: ${attr.done ? 'OK' : 'skip'} — ${attr.reason}`);

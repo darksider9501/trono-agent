@@ -10,8 +10,8 @@
  * already expose — the browser itself is what costs 500-900 MB.
  *
  * This class is a drop-in for `Game` on the read/write surface the agent uses:
- * fetchPage, csrfFor, apiGet, apiPost, postForm, login, heartbeat, idleConfig,
- * isLoggedIn, state, close.
+ * fetchPage, csrfFor, apiGet, apiPost, postForm, postFormJson, postJson, login,
+ * heartbeat, idleConfig, isLoggedIn, state, close.
  *
  * Two rules it does NOT break:
  *   - the anti-detection breaker runs on every request, exactly like in the
@@ -280,6 +280,35 @@ class GameHttp {
         ...(opts.headers || {})
       },
       body
+    });
+    let json = null;
+    try {
+      json = JSON.parse(r.text);
+    } catch (_) {}
+    if (!json) return { ok: false, status: r.status, raw: r.text.slice(0, 400) };
+    return { ...json, status: r.status };
+  }
+
+  /**
+   * POST a JSON body, exactly as a page controller does with
+   * `fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(x)})`.
+   *
+   * `apiPost` cannot be used for this: it sends the csrf in an `x-csrf-token` header,
+   * while the chest endpoint reads the token from the JSON body (see
+   * /assets/js/loot-chests.js: `JSON.stringify({chest_id, csrf})`). Sending the header
+   * instead of the field is rejected, so the transport has to match the controller byte
+   * for byte.
+   */
+  async postJson(apiPath, payload = {}, opts = {}) {
+    if (!opts.allowMutate) throw new Error(`MUTATION_BLOCKED: JSON POST ${apiPath} requires { allowMutate: true }`);
+    const r = await this._fetch(apiPath, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/plain, */*',
+        ...(opts.headers || {})
+      },
+      body: JSON.stringify(payload || {})
     });
     let json = null;
     try {
