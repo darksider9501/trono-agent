@@ -41,12 +41,26 @@ function entry(key) {
   return all[key];
 }
 
+/** How many recent costs are kept for the worst-case estimate. */
+const RECENT = 8;
+/** Fallback spread applied to a measured average when no recent list exists. */
+const WORST_SPREAD = 1.15;
+
 /** Record one finished fight against a target. */
 function record(key, { hpCost, won, level }) {
   const e = entry(key);
   e.fights += 1;
   if (Number.isFinite(hpCost) && hpCost > 0) {
     e.hpCost = e.hpCost === null ? +hpCost.toFixed(1) : +(e.hpCost * (1 - ALPHA) + hpCost * ALPHA).toFixed(1);
+    // A moving average is the right number for planning and the wrong number for
+    // a go/no-go gate. On 2026-11-18 the average for Eryndor sat at 143.9 while
+    // the real cost of the same fight was 368, because earlier cheap kills (more
+    // armour, bigger pool) were still in the average. The gate let a second fight
+    // start on 362 HP and the hero died twice, costing 529 gold. The recent list
+    // keeps the worst case visible so the gate can use it instead.
+    const list = Array.isArray(e.recent) ? e.recent : [];
+    list.push(+hpCost.toFixed(1));
+    e.recent = list.slice(-RECENT);
   }
   if (Number.isFinite(level)) e.level = level;
   if (won) {
@@ -99,6 +113,16 @@ function apply(rows, hero) {
       r.hpCost = e.hpCost;
       r.goldPerHp = +(r.gold / Math.max(1, r.hpCost)).toFixed(4);
     }
+    // Worst cost actually observed, not the average. A gate that plans on the
+    // average loses every fight that lands on the wrong side of the spread.
+    //
+    // `recent` does not exist for entries written before 2026-11-18, so a
+    // measured target with no recent list falls back to the average plus a
+    // spread allowance. Measured spread on Eryndor: average 358.5, worst 374,
+    // so 1.15 covers the observed variance with room to spare.
+    r.hpCostWorst = measured && Array.isArray(e.recent) && e.recent.length
+      ? Math.max(...e.recent)
+      : (measured ? +(r.hpCost * WORST_SPREAD).toFixed(1) : r.hpCostSimulated);
     if (measured) {
       // A target that has never been won is not winnable, whatever the model
       // says. It gets one fresh attempt after each level-up, when the stats that

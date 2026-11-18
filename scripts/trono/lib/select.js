@@ -43,6 +43,18 @@ const STAMINA_PER_MIN = 10 / 60;
 /** Hospital rest refills HP at 2%/min; passive regeneration is 1.5%/min. */
 const REST_FRACTION_PER_MIN = 0.02;
 
+/**
+ * The HP a fight must be able to cover before it is worth starting.
+ *
+ * Uses the worst cost observed rather than the average when the learning module
+ * provides one. The two must agree: `runner.js` gates each kill on this same
+ * number, so if this file planned on the average and the runner gated on the
+ * worst, the runner would keep refusing a fight the selector kept choosing and
+ * the agent would sit idle. On 2026-11-18 the average (358.5) let a second
+ * Eryndor start on 362 HP; the real cost was 368 and the hero died twice.
+ */
+const gateCost = (t) => (Number.isFinite(t.hpCostWorst) ? t.hpCostWorst : t.hpCost);
+
 function chooseFight(hero, targets, opts = {}) {
   const maxFights = opts.maxFights || 2;
   const winnable = (targets || []).filter((t) => t.win && !t.coolingDown);
@@ -50,7 +62,7 @@ function chooseFight(hero, targets, opts = {}) {
     return { action: 'wait', plan: [], reason: 'no winnable target with current stats' };
   }
 
-  const fits = (t, margin) => t.hpCost + margin <= hero.maxHp;
+  const fits = (t, margin) => gateCost(t) + margin <= hero.maxHp;
   let margin = Math.round(hero.maxHp * HP_MARGIN);
   let reachable = winnable.filter((t) => fits(t, margin));
   if (!reachable.length) {
@@ -63,10 +75,10 @@ function chooseFight(hero, targets, opts = {}) {
 
   const byYield = reachable.slice().sort((a, b) => b.goldPerDay - a.goldPerDay || b.goldPerStamina - a.goldPerStamina);
   const tier = byYield[0];
-  const affordable = byYield.filter((t) => t.hpCost + margin <= hero.hp);
+  const affordable = byYield.filter((t) => gateCost(t) + margin <= hero.hp);
 
   if (!affordable.length) {
-    const need = tier.hpCost + margin - hero.hp;
+    const need = gateCost(tier) + margin - hero.hp;
     const perMin = Math.max(1, Math.round(hero.maxHp * REST_FRACTION_PER_MIN));
     const minToReady = Math.ceil(need / perMin);
     return {
@@ -92,7 +104,7 @@ function chooseFight(hero, targets, opts = {}) {
     };
   }
 
-  const need = tier.hpCost + margin - hero.hp;
+  const need = gateCost(tier) + margin - hero.hp;
   const perMin = Math.max(1, Math.round(hero.maxHp * REST_FRACTION_PER_MIN));
   const minToReady = Math.ceil(need / perMin);
   const maxStamina = hero.maxStamina || 65;

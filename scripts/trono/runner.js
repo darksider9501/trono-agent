@@ -205,21 +205,54 @@ async function spendAttributePoints(g, hero, targets) {
   if (points <= 0) return { done: false, reason: 'no points' };
 
   const model = attributes.load();
+  const data = (available && available.data) || {};
+
+  // The game publishes its own coefficients. Trust them over anything we inferred.
+  if (attributes.learnFormulas(data.formulas, model)) {
+    log(`attribute formulas adopted from the API (${Object.keys(data.formulas || {}).length} attributes)`);
+  }
+  const primary = (data.profile && data.profile.primary) || null;
+
   const applied = [];
-  let snapshot = (available.data && available.data.overview) || null;
+  // `derived` is what the POST actually recomputes; `overview` never existed.
+  let snapshot = data.derived || null;
 
-  while (points > 0) {
-    const ranked = attributes.choose(hero, model);
-    const pick = ranked[0];
-    // Every attribute scored zero: no target is winnable at all. Damage is the
-    // only thing that changes that and it does so before the simulation can see
-    // it, so spend there rather than leaving the point idle.
-    // `choose` scores an attribute by the gold/day it unlocks at the next
-    // threshold (`gain`), not by a flat rate, so the zero test is on `gain`.
-    // Comparing `pick.goldPerDay` (undefined) silently disabled this fallback.
-    const fallback = !pick || pick.gain <= 0;
-    const chosen = fallback ? 'strength' : pick.attr;
+  // Decide ONCE, with the whole budget, then commit it.
+  //
+  // Re-choosing before every single point looks safer and is actually wrong.
+  // `simulateFight` rounds damage to whole numbers, so the marginal value of
+  // point 27 is invisible until the points are already there: spending 1 point,
+  // re-scoring, spending 1 point again splits the budget across attributes that
+  // each individually look worthless. That is how 27 points ended up in
+  // `strength` on 2026-11-18. The decision is irreversible, so it is taken once,
+  // on the full amount, and executed.
+  const ranked = attributes.choose(hero, model, points, primary);
+  const pick = ranked[0];
+  if (!pick) return { done: false, reason: 'no rankable attribute', applied };
 
+  // Never spend where nothing is priced. `gain` is gold/day unlocked and
+  // `simSaves` is HP saved per fight; a point that does neither is a point we
+  // cannot justify, and it is irreversible.
+  if (pick.gain <= 0 && pick.simSaves <= 0 && !pick.primary) {
+    return {
+      done: false,
+      reason: `holding ${points} point(s): nothing priced today (best ${pick.attr} gain=${pick.gain} saves=${pick.simSaves})`,
+      applied
+    };
+  }
+
+  const chosen = pick.attr;
+  const why = pick.gain > 0
+    ? `+${pick.gain}g/d`
+    : pick.primary
+      ? 'primary'
+      : `-${pick.simSaves}hp/fight`;
+  log(
+    `attributes: ${points} point(s) -> ${chosen} (${why}; rounds ${pick.base.rounds || '?'} -> ${pick.rounds || '?'}, ` +
+    `rank: ${ranked.slice(0, 3).map((r) => `${r.attr}=${r.gain}`).join(' ')})`
+  );
+
+  for (let i = 0; i < points; i += 1) {
     const page = await g.fetchPage('/pages/overview.php');
     const m = /data-api="\/api\/hero_attributes.php" data-csrf="([0-9a-f]{64})"/.exec(page.html) ||
       /data-overview-attributes[\s\S]{0,400}?data-csrf="([0-9a-f]{64})"/.exec(page.html);
@@ -231,20 +264,29 @@ async function spendAttributePoints(g, hero, targets) {
     });
     if (!res || !res.ok) return { done: applied.length > 0, reason: (res && res.message) || 'post failed', applied };
 
-    const measured = attributes.verify(chosen, snapshot, res.data && res.data.overview, model);
-    if (measured) log(`attribute model: ${chosen} measured ${JSON.stringify(measured)}`);
-    snapshot = (res.data && res.data.overview) || snapshot;
+    // Measure against `derived`, the block the server actually recomputes.
+    const measured = attributes.verifyDerived(chosen, snapshot, res.data && res.data.derived, model);
+    if (measured) log(`attribute observed: ${chosen} -> ${JSON.stringify(measured)}`);
+    if (res.data && res.data.derived) snapshot = res.data.derived;
 
-    applied.push(`${chosen}${fallback ? '(fallback)' : `(+${pick.gain}g/d at ${pick.pointsToNext}p)`}`);
-    // Re-read instead of trusting the projection: the next point must be scored
-    // against what the hero really is, not against what this loop expected.
-    hero = await readHero(g);
-    points = res.data && res.data.points_available !== undefined
-      ? Number(res.data.points_available)
-      : points - 1;
+    applied.push(chosen);
+
+    const left = res.data && res.data.points_available;
+    if (left !== undefined && Number(left) <= 0) break;
+
+    // Re-read so the logged hero and the next POST build on what the server
+    // really holds, not on what this loop expected.
+    if (i === 0 || i === points - 1) hero = await readHero(g);
     attributes.save(model);
   }
-  return { done: true, reason: `applied ${applied.join(', ')}`, applied };
+  attributes.save(model);
+
+  const tally = applied.reduce((acc, a) => ({ ...acc, [a]: (acc[a] || 0) + 1 }), {});
+  return {
+    done: applied.length > 0,
+    reason: `applied ${Object.entries(tally).map(([k, n]) => `${k}x${n}`).join(', ')} — ${why}`,
+    applied
+  };
 }
 
 /**
@@ -494,7 +536,8 @@ async function tick(g, state) {
   await claimDailies(g);
 
   // 3. spend what the game granted
-  const attr = await spendAttributePoints(g, hero, targets);  if (attr.done || attr.reason !== 'no points') log(`attributes: ${attr.done ? 'OK' : 'skip'} — ${attr.reason}`);
+  const attr = await spendAttributePoints(g, hero, targets);
+  if (attr.done || attr.reason !== 'no points') log(`attributes: ${attr.done ? 'OK' : 'skip'} — ${attr.reason}`);
   const skill = await spendSkillPoints(g, hero);
   if (skill.done || skill.reason !== 'no skill points') log(`skills: ${skill.done ? 'OK' : 'skip'} — ${skill.reason}`);
 
@@ -546,13 +589,31 @@ async function tick(g, state) {
     const freshHero = await readHero(g);
     const fresh = learning.apply(rankTargets(freshHero), freshHero).find((t) => t.key === target.key);
     const now = freshHero;
-    if (!fresh || !fresh.win || fresh.coolingDown || fresh.hpCost + margin > now.hp) break;
+    // Go/no-go uses the WORST cost observed, not the average.
+    //
+    // On 2026-11-18 the average for Eryndor was 358.5 and the gate was 362 HP,
+    // so it started a second fight and the hero died (gold -269). Twenty minutes
+    // later the same thing happened again (-260). `hpCost` is a moving average
+    // that still carried cheap kills from when the pool was larger, so comparing
+    // it to the live HP was always optimistic. `hpCostWorst` (lib/learning.js)
+    // is the highest cost in the recent window, which is the number a gate needs.
+    const need = (fresh && fresh.hpCostWorst) + margin;
+    if (!fresh || !fresh.win || fresh.coolingDown || need > now.hp) {
+      if (fresh && fresh.win && !fresh.coolingDown) {
+        log(
+          `skip ${target.name}: needs ${Math.round(need)} HP (worst ${Math.round(fresh.hpCostWorst)} + margin ${margin}), has ${now.hp}`
+        );
+      }
+      break;
+    }
     if (now.stamina < target.stamina) {
       log(`stamina too low for ${target.name} (${now.stamina}/${target.stamina})`);
       break;
     }
 
-    log(`fight ${target.name} (lv${target.level}) — predicted ${target.actions} actions, ${target.hpCost} HP, ${target.exp} EXP`);
+    log(
+      `fight ${target.name} (lv${target.level}) — predicted ${target.actions} actions, ${target.hpCost} HP avg / ${Math.round(fresh.hpCostWorst)} worst, ${target.exp} EXP, hp ${now.hp}/${now.maxHp}`
+    );
     const res = await fight(g, {
       locationId: target.locationId,
       enemyId: target.enemyId,
