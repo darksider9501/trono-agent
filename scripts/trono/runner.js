@@ -473,20 +473,35 @@ async function tick(g, state) {
   }
 
   // 2. free claims
-  const daily = await claimDailyLogin(g);
-  log(`daily_login: ${daily.done ? 'CLAIMED' : 'skip'} — ${daily.reason}`);
-  const prod = await claimProduction(g);
-  log(`production: ${prod.done ? 'CLAIMED' : 'skip'} — ${prod.reason}`);
+  try {
+    const daily = await claimDailyLogin(g);
+    log(`daily_login: ${daily.done ? 'CLAIMED' : 'skip'} — ${daily.reason}`);
+  } catch (e) {
+    log(`daily_login failed: ${e.message}`);
+  }
+  try {
+    const prod = await claimProduction(g);
+    log(`production: ${prod.done ? 'CLAIMED' : 'skip'} — ${prod.reason}`);
+  } catch (e) {
+    log(`production failed: ${e.message}`);
+  }
 
-  const act = await activityProgress(g);
-  if (act) {
-    const reachable = [20, 40, 60, 80, 100].filter((m) => act.current >= m);
-    if (reachable.length) {
-      const res = await claimActivity(g, reachable);
-      log(`activity: ${res.done ? 'CLAIMED' : 'skip'} — ${res.reason}`);
-    } else {
-      log(`activity: skip — ${act.current}/${act.max}`);
+  // Wrapped like every other mutation section: a rejected milestone claim used to
+  // throw straight out of tick() and abort chests, crafting, dailies and fights.
+  // One cosmetic claim must never cost a whole tick of gold.
+  try {
+    const act = await activityProgress(g);
+    if (act) {
+      const reachable = [20, 40, 60, 80, 100].filter((m) => act.current >= m);
+      if (reachable.length) {
+        const res = await claimActivity(g, reachable);
+        log(`activity: ${res.done ? 'CLAIMED' : 'skip'} — ${res.reason}`);
+      } else {
+        log(`activity: skip — ${act.current}/${act.max}`);
+      }
     }
+  } catch (e) {
+    log(`activity failed: ${e.message}`);
   }
 
   // 2b. daily quests: accept first. Progress only counts after accepting, so the two
@@ -538,10 +553,20 @@ async function tick(g, state) {
   await claimDailies(g);
 
   // 3. spend what the game granted
-  const attr = await spendAttributePoints(g, hero, targets);
-  if (attr.done || attr.reason !== 'no points') log(`attributes: ${attr.done ? 'OK' : 'skip'} — ${attr.reason}`);
-  const skill = await spendSkillPoints(g, hero);
-  if (skill.done || skill.reason !== 'no skill points') log(`skills: ${skill.done ? 'OK' : 'skip'} — ${skill.reason}`);
+  // Each of these is a separate irreversible action on a different endpoint; a
+  // rejection on one must not take the other two down with it.
+  try {
+    const attr = await spendAttributePoints(g, hero, targets);
+    if (attr.done || attr.reason !== 'no points') log(`attributes: ${attr.done ? 'OK' : 'skip'} — ${attr.reason}`);
+  } catch (e) {
+    log(`attributes failed: ${e.message}`);
+  }
+  try {
+    const skill = await spendSkillPoints(g, hero);
+    if (skill.done || skill.reason !== 'no skill points') log(`skills: ${skill.done ? 'OK' : 'skip'} — ${skill.reason}`);
+  } catch (e) {
+    log(`skills failed: ${e.message}`);
+  }
 
   try {
     const tal = await talents.spendAll(g, { allowMutate: LIVE });
@@ -799,6 +824,26 @@ async function recover(g) {
     await quiet.sleepWhileQuiet();
   }
 
+  // Pausa humana: tambien antes de acquire(), porque acquire() es un login.
+  // Si el Hub reinicia el proceso mientras esta pausado, sin este gate el
+  // reinicio emitiria un request que el humano acaba de pedir no emitir.
+  // Se re-evalua cada 5 s: leer un archivo local no es un request al juego, y
+  // asi un resume desde el Hub surte efecto en segundos, no en un minuto.
+  let pauseLogged = false;
+  while (control.readControl().paused && !control.readControl().stop) {
+    if (!pauseLogged) {
+      log('pausado por control (Hub) — esperando sin requests hasta el resume');
+      pauseLogged = true;
+    }
+    control.writeTicker({ tick: 0, at: new Date().toISOString(), mode: MODE, state: 'paused' });
+    await sleep(5000);
+  }
+  if (pauseLogged) log('resume: el control ya no esta pausado');
+  if (control.readControl().stop) {
+    log('detencion pedida por control (Hub) — saliendo sin tocar el juego');
+    process.exit(0);
+  }
+
   const got = lock.acquire('runner');
   if (!got.ok) {
     log(`another driver is active (pid ${got.holder.pid}, ${got.holder.name}) — exiting`);
@@ -827,6 +872,7 @@ async function recover(g) {
     let recoverFailures = 0;
     let maintenanceWaits = 0;
     let lastOwnerCheck = 0;
+    let pausedLogged = false;
 
     for (;;) {
       // Si la nube vuelve a estar viva, ceder el mando: dos dueños sobre la
@@ -847,10 +893,17 @@ async function recover(g) {
         continue;
       }
       if (control.readControl().paused) {
-        log('pausado por control (Hub) — esperando 60s sin requests');
+        if (!pausedLogged) {
+          log('pausado por control (Hub) — esperando sin requests hasta el resume');
+          pausedLogged = true;
+        }
         control.writeTicker({ tick: ticks, at: new Date().toISOString(), mode: MODE, state: 'paused' });
-        await sleep(60000);
+        await sleep(5000);
         continue;
+      }
+      if (pausedLogged) {
+        log('resume: el control ya no esta pausado');
+        pausedLogged = false;
       }
       if (control.readControl().stop) {
         log('detención pedida por control (Hub) — saliendo sin tocar el juego');

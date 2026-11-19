@@ -23,26 +23,33 @@ const TICKER_PATH = path.join(STATE_DIR, 'ticker.json');
 const LOG_FILE = process.env.TRONO_LOG_FILE || path.join(__dirname, '..', 'logs', 'runner.log');
 const CLOUD_JSON = process.env.TRONO_CLOUD_JSON || path.join(os.homedir(), '.trono', 'cloud.json');
 
-function cloudConfig() {
+/**
+ * Lee y parsea un JSON tolerando el BOM que dejan Notepad y PowerShell 5.1.
+ * Sin esto, un control.json guardado a mano con BOM devuelve `false` en
+ * silencio: el agente seguiria peleando despues de que el humano lo pauso.
+ */
+function readJson(file) {
   try {
-    const d = JSON.parse(fs.readFileSync(CLOUD_JSON, 'utf8'));
-    // El placeholder no es una URL de nube válida: lo tratamos como "no configurada".
-    if (d && typeof d.url === 'string' && d.url && !d.url.toLowerCase().includes('your_oracle_vm')) {
-      return d;
-    }
-    return null;
+    const raw = fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
+    return JSON.parse(raw);
   } catch {
     return null;
   }
 }
 
-function readControl() {
-  try {
-    const d = JSON.parse(fs.readFileSync(CONTROL_PATH, 'utf8'));
-    return { paused: !!d.paused, stop: !!d.stop, ts: d.ts || null, note: d.note || '' };
-  } catch {
-    return { paused: false, stop: false, ts: null, note: '' };
+function cloudConfig() {
+  const d = readJson(CLOUD_JSON);
+  // El placeholder no es una URL de nube válida: lo tratamos como "no configurada".
+  if (d && typeof d.url === 'string' && d.url && !d.url.toLowerCase().includes('your_oracle_vm')) {
+    return d;
   }
+  return null;
+}
+
+function readControl() {
+  const d = readJson(CONTROL_PATH);
+  if (!d) return { paused: false, stop: false, ts: null, note: '' };
+  return { paused: !!d.paused, stop: !!d.stop, ts: d.ts || null, note: d.note || '' };
 }
 
 function writeControl(patch) {
@@ -56,11 +63,7 @@ function writeControl(patch) {
 }
 
 function readTicker() {
-  try {
-    return JSON.parse(fs.readFileSync(TICKER_PATH, 'utf8'));
-  } catch {
-    return null;
-  }
+  return readJson(TICKER_PATH);
 }
 
 function writeTicker(obj) {
