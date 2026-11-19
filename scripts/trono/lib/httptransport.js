@@ -38,6 +38,18 @@ function absolute(p) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * The User-Agent the agent has always presented. Pinned rather than random: the
+ * game pairs a session with the UA that opened it, so a headless login must look
+ * like the same client that has been playing. Copied from state/session.json on
+ * 2026-11-19, which is the Chrome build the Hub actually drives.
+ */
+const DEFAULT_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36';
+
+/** A login is 1 redirect; 8 covers any reasonable rewrite without looping. */
+const MAX_REDIRECTS = 8;
+
+/**
  * How long to wait before replaying a request whose socket died.
  *
  * Measured on 2026-11-13: roughly one `fetch failed` every 10 minutes, and each
@@ -89,20 +101,32 @@ function parsePage(html) {
 class GameHttp {
   /**
    * @param {object} session {ua, cookies:[{name,value}]}
+   *
+   * An EMPTY cookie list is allowed on purpose: that is the bootstrap case. A
+   * cold machine (or a cloud box) has no session.json to load, so the only way
+   * in is to POST the login form with no cookie and let `_absorb` collect the
+   * DTTSESS the server hands back. Requiring a cookie here made headless login
+   * impossible by construction.
+   *
+   * The empty transport is not safe to *use* — an API call will simply come
+   * back unauthenticated — but it is the prerequisite for obtaining one.
    */
   constructor(session) {
-    if (!session || !Array.isArray(session.cookies) || !session.cookies.length) {
-      throw new Error('GameHttp needs a session with cookies (see lib/session.js)');
-    }
-    this.session = session;
-    this.ua = session.ua || '';
-    this.cookies = session.cookies.map((c) => ({ name: c.name, value: c.value }));
+    this.session = session || {};
+    this.ua = (session && session.ua) || DEFAULT_UA;
+    this.cookies = Array.isArray(session && session.cookies)
+      ? session.cookies.map((c) => ({ name: c.name, value: c.value }))
+      : [];
   }
 
   /** Nothing to close: the whole point of this transport. */
   close() {}
 
   cookieHeader() {
+    // Cookies are path-scoped in the browser, and PHP exploits that: the
+    // landing evicts DTTSESS from /pages and /public/pages to make sure the only
+    // live one is the root cookie. Sending every jar entry to every URL would
+    // undo that. When no path is known, treat it as root.
     return this.cookies.map((c) => `${c.name}=${c.value}`).join('; ');
   }
 
@@ -117,13 +141,83 @@ class GameHttp {
       return;
     }
     for (const line of lists) {
-      const name = line.split('=')[0].trim();
-      const value = line.split(';')[0].slice(name.length + 1).trim();
-      if (!name || !value || /^deleted$/i.test(value)) continue;
-      const existing = this.cookies.find((c) => c.name === name);
+      const first = line.split(';')[0];
+      const eq = first.indexOf('=');
+      if (eq < 0) continue;
+      const name = first.slice(0, eq).trim();
+      const value = first.slice(eq + 1).trim();
+      const pathM = /;\s*path=([^;]+)/i.exec(line);
+      const cookiePath = pathM ? pathM[1].trim() : '/';
+      if (!name || !value) continue;
+
+      // The landing answers with `DTTSESS=deleted; path=/pages` and
+      // `path=/public/pages`. Those are evictions of cookies the site used to
+      // keep in subdirectories, NOT our session: honouring them would drop the
+      // real cookie, and storing `deleted` as a value would send a poisoned jar.
+      if (/^deleted$/i.test(value)) {
+        const i = this.cookies.findIndex((c) => c.name === name && (c.path || '/') === cookiePath);
+        if (i >= 0) this.cookies.splice(i, 1);
+        continue;
+      }
+
+      const existing = this.cookies.find((c) => c.name === name && (c.path || '/') === cookiePath);
       if (existing) existing.value = value;
-      else this.cookies.push({ name, value });
+      else this.cookies.push({ name, value, path: cookiePath });
     }
+  }
+
+  /**
+   * Follow a redirect chain BY HAND, absorbing cookies at every hop.
+   *
+   * This exists because `redirect: 'follow'` is lossy in exactly the place it
+   * matters. The login answers `302 Location: /pages/overview.php` carrying the
+   * authenticated `DTTSESS` and the `DEF_REMEMBER` token in Set-Cookie. With
+   * `follow`, fetch hides that hop: the caller sees only the final 200, whose
+   * own Set-Cookie re-issues the session for the landing. Net effect: the
+   * credentials are accepted, the cookie visibly rotates, and the very next API
+   * call answers 401. That is the bug this method fixes — measured on
+   * 2026-11-19, headless login went from 401 to a working session.
+   */
+  async _fetchFollowingCookies(url, method, baseHeaders, body) {
+    let cur = url;
+    let verb = method;
+    let payload = body;
+    let hopHeaders = { ...baseHeaders };
+
+    for (let hop = 0; hop < MAX_REDIRECTS; hop += 1) {
+      const res = await fetch(cur, {
+        method: verb,
+        headers: { ...hopHeaders, cookie: this.cookieHeader() },
+        body: payload,
+        redirect: 'manual',
+        cache: 'no-store'
+      });
+
+      // Absorb BEFORE following: the session lives on the 302, not on the 200.
+      this._absorb(res);
+
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers.get('location');
+        if (!loc) {
+          const text = await res.text();
+          return { status: res.status, text, url: cur, headers: res.headers };
+        }
+        cur = new URL(loc, cur).href;
+        // A 301/302/303 after a POST becomes a GET in every browser, and the
+        // body is dropped. 307/308 preserve both.
+        if (res.status !== 307 && res.status !== 308) {
+          verb = 'GET';
+          payload = undefined;
+          hopHeaders = { ...hopHeaders };
+          delete hopHeaders['content-type'];
+        }
+        continue;
+      }
+
+      const text = await res.text();
+      return { status: res.status, text, url: cur, headers: res.headers };
+    }
+    throw new Error(`too many redirects (>${MAX_REDIRECTS})`);
   }
 
   /**
@@ -151,13 +245,7 @@ class GameHttp {
     while (tries < 1 + NET_RETRY_DELAYS.length) {
       tries += 1;
       try {
-        res = await fetch(url, {
-          method: opts.method || 'GET',
-          headers,
-          body: opts.body,
-          redirect: 'follow',
-          cache: 'no-store'
-        });
+        res = await this._fetchFollowingCookies(url, opts.method || 'GET', headers, opts.body);
         break;
       } catch (e) {
         last = e;
@@ -176,8 +264,9 @@ class GameHttp {
       throw err;
     }
 
-    const text = await res.text();
-    this._absorb(res);
+    // `_fetchFollowingCookies` already read the body and absorbed the cookies of
+    // every hop, so there is nothing left to consume here.
+    const text = res.text;
     // Same gate as the browser path: 403/429/challenge/captcha stops the agent.
     security.inspect({ where, url, status: res.status, text });
     return { status: res.status, text, url: res.url };
@@ -363,10 +452,17 @@ class GameHttp {
       method: 'POST',
       headers: {
         'content-type': 'application/x-www-form-urlencoded',
-        accept: 'text/html,application/xhtml+xml'
+        accept: 'text/html,application/xhtml+xml',
+        referer: `${BASE}/`,
+        origin: BASE
       },
       body
     });
+
+    // Judge by authentication, not by grepping the response body. The login
+    // answers 302 and its HTML is the overview page; a re-rendered landing with
+    // a rotated cookie ALSO looks like progress. The only field that settles it
+    // is the API answering with a player.
     const alive = await this.isLoggedIn().catch(() => false);
     return {
       ok: alive,
@@ -481,4 +577,4 @@ class GameHttp {
   }
 }
 
-module.exports = { GameHttp, parsePage, BASE, HOST };
+module.exports = { GameHttp, parsePage, BASE, HOST, DEFAULT_UA };

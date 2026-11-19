@@ -20,7 +20,7 @@
  */
 const fs = require('fs');
 const path = require('path');
-const { GameHttp } = require('./httptransport');
+const { GameHttp, DEFAULT_UA } = require('./httptransport');
 
 const STATE_DIR = process.env.TRONO_STATE_DIR || path.join(__dirname, '..', 'state');
 const SESSION_PATH = path.join(STATE_DIR, 'session.json');
@@ -84,6 +84,97 @@ async function verify(session) {
     );
     return { ok: false, error: e.message, network };
   }
+}
+
+/**
+ * Log in over plain HTTP, with no browser at all.
+ *
+ * This is what makes a cloud box possible. `fromBrowser` reads an HttpOnly
+ * cookie over CDP, so it can only ever work on the machine that owns a Chrome
+ * window. A VPS has no tab, no CDP port and no fingerprint to copy: the only way
+ * in is the login form itself, which `GameHttp.login` already POSTs correctly
+ * (csrf, form-encoded body, redirect:follow).
+ *
+ * The security property from `handoff` is preserved: nothing is written to
+ * session.json until `verify` proved the collected cookie actually opens
+ * player_state. A login that returns 200 but leaves a dead cookie is worthless,
+ * and saving it would make the next run start from a lie.
+ *
+ * Returns {ok, session?, error?}. Never throws for a bad credential: the caller
+ * decides whether that is fatal or worth a retry.
+ */
+async function loginHeadless({ credentials: creds } = {}) {
+  const c = creds || require('./credentials').load();
+  if (!c || !c.username || !c.password) {
+    return { ok: false, error: 'no credentials (state/credentials.json or TRONO_USER/TRONO_PASS)' };
+  }
+
+  // An empty cookie jar is legal now: this transport exists to collect one.
+  const http = new GameHttp({ ua: DEFAULT_UA, cookies: [] });
+  let res;
+  try {
+    res = await http.login({ username: c.username, password: c.password, remember: true });
+  } catch (e) {
+    // A network failure is not a rejected password. Keep them distinguishable:
+    // retrying a login into an outage is the pattern that gets accounts flagged.
+    const network = /^network:|fetch failed|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|ECONNREFUSED/i.test(
+      e.message || ''
+    );
+    return { ok: false, error: e.message, network };
+  }
+
+  if (!res || !res.ok) {
+    return {
+      ok: false,
+      error: res ? `login not accepted (status ${res.status}, ${res.len}b)` : 'login returned nothing',
+      status: res && res.status
+    };
+  }
+
+  const collected = http.cookies.filter((x) => KEEP.test(x.name));
+  if (!collected.some((x) => /^DTTSESS$/i.test(x.name))) {
+    return {
+      ok: false,
+      error: `login succeeded but no DTTSESS came back (got: ${http.cookies.map((x) => x.name).join(', ') || 'none'})`
+    };
+  }
+
+  const session = {
+    exportedAt: new Date().toISOString(),
+    ua: http.ua,
+    cookies: collected.map((x) => ({ name: x.name, value: x.value })),
+    browserGold: null,
+    source: 'headless'
+  };
+
+  // Prove it before trusting it. Same gate as the browser handoff.
+  const check = await verify(session);
+  if (!check.ok) {
+    return { ok: false, error: `cookie did not verify: ${check.error}`, network: check.network };
+  }
+  return { ok: true, session, check };
+}
+
+/**
+ * Session as the runner wants it: load it, and if it is dead or absent, rebuild
+ * it over HTTP instead of demanding a browser.
+ *
+ * `--force` style recovery is deliberately explicit: this is the only path the
+ * agent has when it wakes up cold on a machine that never saw a Chrome window.
+ */
+async function ensure({ login = true } = {}) {
+  const saved = load();
+  if (saved) {
+    const v = await verify(saved);
+    if (v.ok) return { ok: true, session: saved, via: 'saved', check: v };
+    if (v.network) return { ok: false, via: 'saved', error: v.error, network: true };
+    clear();
+  }
+  if (!login) return { ok: false, error: 'no usable session and login disabled' };
+  const out = await loginHeadless();
+  if (!out.ok) return out;
+  save(out.session, { verified: true, goldAtHandoff: out.check.gold, hpAtHandoff: out.check.hp });
+  return { ok: true, session: out.session, via: 'headless', check: out.check };
 }
 
 function save(session, extra = {}) {
@@ -153,4 +244,15 @@ async function closeIdleBrowser(port = 9777) {
   }
 }
 
-module.exports = { SESSION_PATH, fromBrowser, verify, save, load, clear, ageMinutes, closeIdleBrowser };
+module.exports = {
+  SESSION_PATH,
+  fromBrowser,
+  loginHeadless,
+  ensure,
+  verify,
+  save,
+  load,
+  clear,
+  ageMinutes,
+  closeIdleBrowser
+};
