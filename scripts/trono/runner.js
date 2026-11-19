@@ -786,8 +786,17 @@ async function recover(g) {
   const got = lock.acquire('runner');
   if (!got.ok) {
     log(`another driver is active (pid ${got.holder.pid}, ${got.holder.name}) — exiting`);
+    log(`lock state: ${lock.describe()}`);
     process.exit(2);
   }
+  if (got.stale) log(`took over a stale driver lock (${got.stale})`);
+
+  // Keep the lock fresh and stop driving the tab the moment we lose it. Without
+  // this the file ages out after TTL_MS and a second process can take over while
+  // this one is still mid-fight, which invalidates both sessions.
+  const beat = lock.keepAlive(() => {
+    log('driver lock was taken by another process — our session is invalid, stopping');
+  });
 
   const acquired = await acquire();
   let g = acquired.g;
@@ -869,6 +878,9 @@ async function recover(g) {
       await sleep(loopSeconds * 1000);
     }
   } finally {
+    try {
+      beat.stop();
+    } catch (e) {}
     try {
       g.close();
     } catch (e) {}
