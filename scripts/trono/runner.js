@@ -27,6 +27,8 @@ const talents = require('./lib/talents');
 const craft = require('./lib/craft');
 const chests = require('./lib/chests');
 const security = require('./lib/security');
+const quiet = require('./lib/quiet');
+const control = require('./lib/control');
 const session = require('./lib/session');
 const { GameHttp } = require('./lib/httptransport');
 
@@ -783,6 +785,20 @@ async function recover(g) {
     process.exit(3);
   }
 
+  // Dueño único: si la nube está vivo y se cobijó, este runner es standby: hace
+  // ni un login ni un request. El gate va antes de adquirir el lock: acquire()
+  // ya es un login. El runner en la nube tiene TRONO_ON_CLOUD=1 y lo salta.
+  if (!process.env.TRONO_ON_CLOUD && (await control.cloudOwnerActive())) {
+    log(`cloud en ${control.cloudConfig()?.url || 'la nube'}: agente standby local (el cloud es owner) — saliendo sin requests`);
+    process.exit(0);
+  }
+
+  // Silencio programado (00:00-07:00 hora Cuba): antes de adquirir lock/login.
+  if (quiet.state().quiet) {
+    log('horario de silencio: sin requests hasta el fin de la ventana (America/Havana)');
+    await quiet.sleepWhileQuiet();
+  }
+
   const got = lock.acquire('runner');
   if (!got.ok) {
     log(`another driver is active (pid ${got.holder.pid}, ${got.holder.name}) — exiting`);
@@ -801,14 +817,45 @@ async function recover(g) {
   const acquired = await acquire();
   let g = acquired.g;
   log(`transport: ${acquired.via} (mode ${MODE})`);
+  // Ticker inicial: el Hub necesita saber que el proceso está vivo desde el
+  // arranque, no recién después del primer tick (que puede tardar minutos).
+  control.writeTicker({ tick: 0, at: new Date().toISOString(), mode: MODE, state: 'starting' });
   try {
     let cfg = await g.idleConfig();
     let ticks = 0;
     let failures = 0;
     let recoverFailures = 0;
     let maintenanceWaits = 0;
+    let lastOwnerCheck = 0;
 
     for (;;) {
+      // Si la nube vuelve a estar viva, ceder el mando: dos dueños sobre la
+      // misma cuenta se rotan el DTTSESS y los dos quedan en 401. Se consulta
+      // cada minuto (tráfico local, cero requests al juego).
+      if (!process.env.TRONO_ON_CLOUD && Date.now() - lastOwnerCheck > 60000) {
+        lastOwnerCheck = Date.now();
+        if (await control.cloudOwnerActive()) {
+          log('cloud volvió: este runner se retira (el cloud es owner) — sin más requests');
+          break;
+        }
+      }
+      if (quiet.state().quiet) {
+        const s = quiet.state();
+        log(`horario de silencio (${quiet.fmt(s.until)}): sin requests. Dormir...`);
+        control.writeTicker({ tick: ticks, at: new Date().toISOString(), mode: MODE, state: 'quiet' });
+        await quiet.sleepWhileQuiet();
+        continue;
+      }
+      if (control.readControl().paused) {
+        log('pausado por control (Hub) — esperando 60s sin requests');
+        control.writeTicker({ tick: ticks, at: new Date().toISOString(), mode: MODE, state: 'paused' });
+        await sleep(60000);
+        continue;
+      }
+      if (control.readControl().stop) {
+        log('detención pedida por control (Hub) — saliendo sin tocar el juego');
+        break;
+      }
       try {
         const hb = await g.heartbeat(cfg);
         if (!hb.alive) {
@@ -816,6 +863,7 @@ async function recover(g) {
         }
         ticks += 1;
         await tick(g, { tick: ticks });
+        control.writeTicker({ tick: ticks, at: new Date().toISOString(), mode: MODE });
         // Helpers deep in the tick catch their own errors and return "skip", so a
         // halt detected there would otherwise be swallowed and the loop would
         // keep poking the site. The file is the source of truth, not the throw.
@@ -885,6 +933,11 @@ async function recover(g) {
       g.close();
     } catch (e) {}
     lock.release();
+    // El ticker es liveness: si el proceso muere, el Hub no debe creer que
+    // sigue vivo con un PID reciclado.
+    try {
+      control.writeTicker({ tick: -1, at: new Date().toISOString(), mode: MODE, state: 'stopped' });
+    } catch (e) {}
   }
 })().catch((e) => {
   if (e && e.code === 'SECURITY_HALT') {
