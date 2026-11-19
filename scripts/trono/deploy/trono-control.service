@@ -1,0 +1,43 @@
+[Unit]
+Description=Defiende el Trono - control server (status/pause/resume/stop)
+Documentation=file:/opt/trono/scripts/trono/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+# Independiente del runner a proposito. Si el agente se cae, el Hub tiene que
+# poder seguir consultando /api/health para distinguir "caido" de "no responde":
+# con los dos en la misma unidad, una caida del runner mataba el canal de
+# diagnostico y desde la casa se veia igual que la VM apagada.
+[Service]
+Type=simple
+User=trono
+Group=trono
+WorkingDirectory=/opt/trono/scripts/trono
+EnvironmentFile=/etc/trono/trono.env
+Environment=HOME=/home/trono
+
+ExecStart=/usr/bin/node /opt/trono/scripts/trono/tools/cloud-control-server.js
+
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/trono/scripts/trono/state
+ReadWritePaths=/opt/trono/scripts/trono/logs
+ReadWritePaths=/var/log/trono
+
+RestrictAddressFamilies=AF_INET AF_INET6
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+StandardOutput=append:/var/log/trono/control.out.log
+StandardError=append:/var/log/trono/control.out.log
+
+[Install]
+WantedBy=multi-user.target

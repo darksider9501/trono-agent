@@ -30,6 +30,11 @@ const control = require('../lib/control');
 const quiet = require('../lib/quiet');
 
 const PORT = Number(process.env.TRONO_CLOUD_PORT || 8091);
+// Default 0.0.0.0 conserva el comportamiento historico. En una VM publica se
+// ata a una IP concreta (o a 127.0.0.1 con un tunel delante) para no regalar
+// el puerto a internet: sin esto, el token es lo unico que separa al mundo de
+// la cuenta del juego.
+const HOST = process.env.TRONO_CLOUD_HOST || '0.0.0.0';
 const MACHINE = process.env.TRONO_MACHINE || 'oracle';
 const START_MS = Date.now();
 
@@ -114,9 +119,9 @@ try {
   fs.mkdirSync(path.dirname(CLOUD_JSON_PATH), { recursive: true });
 } catch {}
 
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, HOST, () => {
   const auth = TOKEN ? 'token requerido' : 'SIN TOKEN (dev)';
-  console.log(`[trono-cloud] control server: http://0.0.0.0:${PORT}  (${auth})`);
+  console.log(`[trono-cloud] control server: http://${HOST}:${PORT}  (${auth})`);
   console.log(`[trono-cloud] status: GET /api/status | health: GET /api/health`);
   console.log(`[trono-cloud] controles: POST /api/control/{pause,resume,stop}`);
 });

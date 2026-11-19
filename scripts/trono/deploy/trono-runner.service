@@ -1,0 +1,62 @@
+[Unit]
+Description=Defiende el Trono - agente autonomo (HTTP, sin navegador)
+Documentation=file:/opt/trono/scripts/trono/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+# Si el proceso muere, vuelve en 30 s: la sesion se rehace sola por login
+# headless. Pero un fallo de credenciales no se arregla solo, asi que despues de
+# 5 intentos en 15 minutos systemd deja de reintentar en vez de martillar el
+# login del juego. Estas dos claves son de [Unit], no de [Service]: en [Service]
+# systemd las ignora con un warning y el limite no se aplica.
+StartLimitBurst=5
+StartLimitIntervalSec=900
+
+[Service]
+Type=simple
+User=trono
+Group=trono
+WorkingDirectory=/opt/trono/scripts/trono
+EnvironmentFile=/etc/trono/trono.env
+
+# lib/credentials.js resuelve ~/.trono/credentials.json con os.homedir(). Si
+# HOME no esta puesto, o apunta a /root, el servicio arranca "sin credenciales"
+# y el error en el journal no menciona HOME por ningun lado.
+Environment=HOME=/home/trono
+
+# El agente no necesita navegador ni X: corre sobre HTTP puro. Que el fallo sea
+# ruidoso en el journal en vez de silencioso en un archivo es lo que permite
+# diagnosticar un bucle de reinicio sin entrar por SSH.
+ExecStart=/usr/bin/node /opt/trono/scripts/trono/runner.js --live --loop=300
+
+# Un tick normal tarda 20-40 s.
+Restart=on-failure
+RestartSec=30
+
+# El silencio nocturno (00:00-07:00 America/Havana) es codigo, no systemd: un
+# timer que apague el servicio dejaria al agente sin poder escribir el ticker, y
+# el Hub lo leeria como caido. El proceso sigue vivo y simplemente no emite un
+# solo request durante la ventana.
+
+# Endurecimiento basico. El agente solo escribe en state/ y logs/.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/trono/scripts/trono/state
+ReadWritePaths=/opt/trono/scripts/trono/logs
+ReadWritePaths=/var/log/trono
+
+# Sin privilegios de red: no abre puertos, solo hace peticiones salientes.
+RestrictAddressFamilies=AF_INET AF_INET6
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+StandardOutput=append:/var/log/trono/runner.out.log
+StandardError=append:/var/log/trono/runner.out.log
+
+[Install]
+WantedBy=multi-user.target

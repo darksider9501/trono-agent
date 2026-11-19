@@ -97,11 +97,14 @@ const WITHDRAW_GOLD = 100000;
 const fightsArg = args.find((a) => a.startsWith('--fights='));
 const maxFights = fightsArg ? parseInt(fightsArg.split('=')[1], 10) : 2;
 
-const LOG_DIR = path.join(__dirname, 'logs');
-const LOG = path.join(LOG_DIR, 'runner.log');
+// El control server ya respeta TRONO_LOG_FILE; el runner no, y eso rompe el
+// despliegue en la nube: el proceso escribe en una ruta y el Hub lee otra, asi
+// que el panel se queda en blanco aunque el agente este trabajando.
+const LOG_DIR = process.env.TRONO_LOG_DIR || path.join(__dirname, 'logs');
+const LOG = process.env.TRONO_LOG_FILE || path.join(LOG_DIR, 'runner.log');
 
 function log(msg, data) {
-  fs.mkdirSync(LOG_DIR, { recursive: true });
+  fs.mkdirSync(path.dirname(LOG), { recursive: true });
   const line = `[${new Date().toISOString()}] ${msg}${data ? ' ' + JSON.stringify(data) : ''}`;
   console.log(line);
   try {
@@ -755,7 +758,18 @@ async function acquire() {
       session.clear();
     }
     if (MODE === 'http') {
-      throw new Error('mode=http needs a verified state/session.json; run once in hybrid to create it');
+      // Una VM arranca en frio: no hay session.json, y hasta ahora esto tiraba un
+      // throw. Pero el login headless existe y funciona sin navegador, que es
+      // justamente la razon por la que la nube es posible. Sin esta rama el
+      // servicio de systemd entraba en bucle de reinicio para siempre.
+      log('mode=http sin sesion guardada — login headless');
+      const out = await session.ensure();
+      if (!out.ok) {
+        const why = out.network ? `red (${out.error})` : out.error || 'login rechazado';
+        throw new Error(`login headless fallo en la nube: ${why}`);
+      }
+      log(`http session ${out.via} (${out.check.user} lv${out.check.level}, gold ${out.check.gold})`);
+      return { g: new GameHttp(out.session), via: `http-${out.via}` };
     }
   }
 
