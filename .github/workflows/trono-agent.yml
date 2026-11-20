@@ -31,7 +31,19 @@ on:
   # el job despierta, duerme y espera el fin de ventana sin emitir un request).
   schedule:
     - cron: '0 7,13,19,1 * * *'
-  workflow_dispatch: {}
+
+  # Sin inputs, una corrida manual usa el mismo presupuesto de 330 min que el
+  # cron. Eso hace imposible la primera prueba: la unica forma de saber si el
+  # login headless funciona desde una IP de Azure seria quemar 5 h 30 en
+  # averiguarlo. Con `max_minutes` la primera corrida dura 5 min y el log se
+  # lee en el momento.
+  workflow_dispatch:
+    inputs:
+      max_minutes:
+        description: 'Minutos de vida del agente. Vacio = 330 (el default del cron). Usar 5 para una prueba.'
+        required: false
+        default: ''
+        type: string
 
 # Dos corridas nunca deben solaparse: dos logins sobre la misma cuenta se rotan
 # el DTTSESS y los dos quedan en 401. cancel-in-progress false porque matar un
@@ -63,7 +75,10 @@ jobs:
       TRONO_ON_CLOUD: '1'
       TRONO_LOOP: '300'
       # 330 min de loop: sale solo 25 min antes del timeout del job.
-      TRONO_MAX_MINUTES: '330'
+      # En una corrida manual se puede pisar con el input `max_minutes`
+      # (vacio = 330). El operador `||` devuelve el operando derecho cuando el
+      # izquierdo es falsy, y una cadena vacia lo es: sin input, 330.
+      TRONO_MAX_MINUTES: ${{ inputs.max_minutes || '330' }}
       # Cap de crafteo: 300 de oro, decision humana. 0 lo apaga.
       TRONO_CRAFT_MAX_GOLD: '300'
       # Cuba mantiene el horario de verano permanente: UTC-4 fijo.

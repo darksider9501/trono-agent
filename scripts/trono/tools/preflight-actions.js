@@ -242,15 +242,56 @@ check('workflow', 'el YAML parsea', true, () => {
   return { pass: true, detail: 'parsea sin error' };
 });
 
+/**
+ * Resuelve TRONO_MAX_MINUTES a un numero.
+ *
+ * Acepta un literal ("330") o una expresion de Actions con un numero como
+ * fallback. La forma real en el workflow es:
+ *
+ *   TRONO_MAX_MINUTES: ${{ inputs.max_minutes || '330' }}
+ *
+ * Con input vacio toma 330; con `max_minutes=5` toma 5. Al preflight le
+ * interesa el caso WORST CASE (el mayor de los dos), porque es el que puede
+ * comerse el timeout del job.
+ */
+function resolveMaxMinutes(v) {
+  if (v === undefined || v === null) return NaN;
+  const s = String(v).trim();
+
+  // Literal.
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+
+  // Expresion de Actions: sacar todos los numeros y quedarse con el mayor.
+  const nums = [...s.matchAll(/'?(\d+)'?/g)].map((m) => parseInt(m[1], 10)).filter((n) => n > 0);
+  if (nums.length) return Math.max(...nums);
+
+  return NaN;
+}
+
+/**
+ * Resuelve TRONO_LOOP a segundos, con la misma idea.
+ */
+function resolveLoop(v) {
+  if (v === undefined || v === null) return NaN;
+  const s = String(v).trim();
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  const nums = [...s.matchAll(/'?(\d+)'?/g)].map((m) => parseInt(m[1], 10)).filter((n) => n > 0);
+  return nums.length ? Math.max(...nums) : NaN;
+}
+
 if (wf) {
   const job = (wf.jobs && wf.jobs.run) || {};
   const env = job.env || {};
 
   check('tiempos', 'TRONO_MAX_MINUTES < timeout-minutes (margen para salir limpio)', true, () => {
-    const max = parseInt(env.TRONO_MAX_MINUTES, 10);
+    const max = resolveMaxMinutes(env.TRONO_MAX_MINUTES);
     const timeout = parseInt(job['timeout-minutes'], 10);
     if (!Number.isFinite(max) || !Number.isFinite(timeout)) {
-      return { pass: false, detail: `max=${env.TRONO_MAX_MINUTES} timeout=${job['timeout-minutes']}` };
+      return {
+        pass: false,
+        detail: `no pude resolver max=${env.TRONO_MAX_MINUTES} timeout=${job['timeout-minutes']}`,
+        fix: 'TRONO_MAX_MINUTES debe ser un numero o una expresion con un numero como fallback',
+      };
     }
     const margin = timeout - max;
     return {
@@ -266,9 +307,35 @@ if (wf) {
   });
 
   check('tiempos', 'TRONO_LOOP < TRONO_MAX_MINUTES', true, () => {
-    const loop = parseInt(env.TRONO_LOOP, 10);
-    const max = parseInt(env.TRONO_MAX_MINUTES, 10);
-    return { pass: loop > 0 && loop < max * 60, detail: `loop ${loop}s vs ${max} min de vida` };
+    const loop = resolveLoop(env.TRONO_LOOP);
+    const max = resolveMaxMinutes(env.TRONO_MAX_MINUTES);
+    return {
+      pass: Number.isFinite(loop) && Number.isFinite(max) && loop > 0 && loop < max * 60,
+      detail: `loop ${loop}s vs ${max} min de vida`,
+      fix: 'un loop mas largo que la vida del job no corre nunca',
+    };
+  });
+
+  check('workflow', 'workflow_dispatch acepta un presupuesto corto (primera prueba)', false, () => {
+    // YAML 1.1 (y pyyaml) resuelve la clave `on:` al booleano true, no a la
+    // cadena "on". Hay que aceptar las dos formas o el check es ciego y
+    // siempre reporta "sin inputs".
+    const triggers = wf.on || wf[true] || wf.true || {};
+    const dispatch = triggers.workflow_dispatch;
+    if (!dispatch) return { pass: false, detail: 'no hay workflow_dispatch' };
+    const names = Object.keys(dispatch.inputs || {});
+    return {
+      pass: names.includes('max_minutes'),
+      detail: names.length ? `inputs: ${names.join(', ')}` : 'workflow_dispatch sin inputs',
+      fix: 'sin input, la primera corrida manual gasta 330 min (5h30) para averiguar si el login anda',
+    };
+  });
+
+  check('workflow', 'el cron esta definido', false, () => {
+    const triggers = wf.on || wf[true] || wf.true || {};
+    const sched = triggers.schedule;
+    if (!Array.isArray(sched) || !sched.length) return { pass: false, detail: 'sin schedule' };
+    return { pass: true, detail: sched.map((s) => s.cron).join(' | ') };
   });
 
   check('dormancia', 'TRONO_TZ_OFFSET_MIN = -240 (Cuba, UTC-4 fijo)', true, () => {
