@@ -33,7 +33,7 @@ ExecStart=/usr/bin/node /opt/trono/scripts/trono/runner.js --live --loop=300
 Restart=on-failure
 RestartSec=30
 
-# El silencio nocturno (00:00-07:00 America/Havana) es codigo, no systemd: un
+# La dormancia nocturna (23:30-06:30 hora Cuba) es codigo, no systemd: un
 # timer que apague el servicio dejaria al agente sin poder escribir el ticker, y
 # el Hub lo leeria como caido. El proceso sigue vivo y simplemente no emite un
 # solo request durante la ventana.

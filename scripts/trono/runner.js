@@ -832,10 +832,14 @@ async function recover(g) {
     process.exit(0);
   }
 
-  // Silencio programado (00:00-07:00 hora Cuba): antes de adquirir lock/login.
-  if (quiet.state().quiet) {
-    log('horario de silencio: sin requests hasta el fin de la ventana (America/Havana)');
-    await quiet.sleepWhileQuiet();
+  // Dormancia programada (se acuesta 23:30-00:30, despierta 05:30-06:30 hora
+  // Cuba): antes de adquirir lock/login.
+  {
+    const s0 = quiet.state();
+    if (s0.quiet) {
+      log(`horario de silencio: sin requests hasta ${quiet.fmtMs(s0.until)} (${quiet.tzLabel()})`);
+      await quiet.sleepWhileQuiet();
+    }
   }
 
   // Pausa humana: tambien antes de acquire(), porque acquire() es un login.
@@ -901,7 +905,7 @@ async function recover(g) {
       }
       if (quiet.state().quiet) {
         const s = quiet.state();
-        log(`horario de silencio (${quiet.fmt(s.until)}): sin requests. Dormir...`);
+        log(`horario de silencio: sin requests hasta ${quiet.fmtMs(s.until)} (${quiet.tzLabel()}). Dormir...`);
         control.writeTicker({ tick: ticks, at: new Date().toISOString(), mode: MODE, state: 'quiet' });
         await quiet.sleepWhileQuiet();
         continue;

@@ -155,11 +155,28 @@ Alternativa mejor que abrir el puerto: un tunel WireGuard o Tailscale, y dejar
 
 ## Trampas que ya costaron tiempo
 
-**El silencio nocturno no es un timer de systemd.** Un `OnCalendar` que apague el
+**La dormancia nocturna no es un timer de systemd.** Un `OnCalendar` que apague el
 servicio dejaria al agente sin poder escribir `state/ticker.json`, y el Hub lo
 leeria como caido. La ventana vive dentro del loop: el proceso sigue vivo, el
 ticker sigue fresco, y no sale un solo request. La sesion se cae sola y se
-reloguea a las 07:00.
+reloguea al despertar.
+
+**La hora de Cuba es UTC-4 fijo, y la tzdata no lo sabe.** Cuba decidio mantener
+el horario de verano de forma permanente. La tzdata 2026e todavia registra la
+vuelta a UTC-5 el 2026-11-02, asi que `Intl` con `America/Havana` —y cualquier
+libreria que consulte la base de zonas— devuelve **una hora de menos** y adelanta
+la dormancia una hora. Por eso `lib/quiet.js` no consulta `Intl`: resta
+`TRONO_TZ_OFFSET_MIN` (default `-240`). El reloj de Windows, que se quedo en
+horario de verano, marca la hora correcta. Si el pais volviera a mover el reloj,
+se cambia esa variable.
+
+**El sorteo de la ventana necesita avalancha, no solo un hash.** FNV-1a sobre
+fechas consecutivas (`2026-11-20` → `2026-11-21`) tiene una propiedad venenosa:
+`16777619 ≡ -1 (mod 60)`, asi que `hash % 60` devolvia `00:07, 00:08, 00:09...`
+Un horario que se corre un minuto por noche es MAS delator que uno fijo. La
+solucion es un finalizador murmur3 (`fmix32`) y escalar en vez de usar modulo.
+El selftest falla si la diferencia entre noches consecutivas se repite mas del
+25% de las veces.
 
 **`TRONO_MODE=http` con `state/session.json` ausente.** Hasta hace poco eso
 lanzaba una excepcion ("run once in hybrid to create it"), que en una VM recien
