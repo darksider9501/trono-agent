@@ -43,6 +43,12 @@ concurrency:
 permissions:
   contents: read
 
+# El cache se escribe solo desde triggers confiables (push, workflow_dispatch,
+# schedule). `cache-mode: write` es explicito a proposito: si algun dia se
+# agrega un trigger influenciable por terceros, el default pasaria a read-only
+# y el cache se romperia en silencio. Declararlo deja el contrato claro.
+cache-mode: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -124,9 +130,26 @@ jobs:
       # El driver.lock vive en logs/ (no en state/) y se borra ANTES de guardar:
       # ver el comentario del paso "Run agent". Un lock es estado de la maquina,
       # no del proyecto.
-      - name: Drop machine-local lock before caching
+      #
+      # session.json TAMBIEN se borra, y es lo mas importante de este paso.
+      # Contiene la cookie DTTSESS viva. La documentacion de Actions es
+      # explicita: "Anyone who can open a pull request against your repository
+      # can read the contents of caches in the base branch". En un repo publico
+      # eso significa que cualquiera abre un PR y lee este cache: se lleva la
+      # sesion y puede retirar el oro a su propia wallet.
+      #
+      # No se pierde nada real: sin session.json el agente hace login headless
+      # (verificado, 9,9 s) y el estado que importa (learning.json, control.json)
+      # si persiste. Se cambia "una sesion cacheada" por "un login por job",
+      # o sea ~4 logins/dia en vez de ~2,2 medidos. Es barato comparado con
+      # publicar una credencial.
+      - name: Purge machine-local and credential files before caching
         if: always()
-        run: rm -f scripts/trono/logs/driver.lock scripts/trono/state/driver.lock
+        run: |
+          rm -f scripts/trono/logs/driver.lock scripts/trono/state/driver.lock
+          rm -f scripts/trono/state/session.json
+          echo "no cacheado: driver.lock (local a la maquina), session.json (cookie viva)"
+          ls -la scripts/trono/state/ || true
 
       - name: Save state
         if: always()

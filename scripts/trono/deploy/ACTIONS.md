@@ -131,6 +131,28 @@ dormiría más allá del corte de GitHub y moriría de SIGKILL sin liberar el lo
 
 **No subir `logs/` ni `state/` al repo.** Contienen la cookie de sesión.
 
+**NUNCA cachear `state/session.json`.** Es el riesgo más caro de todo esto y no
+tiene nada que ver con que baneen la cuenta. La documentación de Actions lo dice
+sin rodeos:
+
+> Anyone who can open a pull request against your repository can read the
+> contents of caches in the base branch. Don't write secrets, tokens, or
+> credentials to a cached path.
+
+`session.json` guarda la cookie `DTTSESS` **viva**. En un repo público cualquiera
+abre un PR, lee el cache, se queda con la sesión y puede retirar el oro a su
+propia wallet. Eso no es "perder la cuenta por baneo": es que te la vacíen.
+
+Por eso el workflow borra `state/session.json` antes de guardar el cache. Lo que
+se persiste es `learning.json` y `control.json`; la sesión se regenera con un
+login headless (9,9 s, verificado). El costo es pasar de ~2,2 a ~4 logins/día.
+Barato comparado con publicar una credencial.
+
+**`cache-mode: write` está declarado explícitamente** en el workflow. El default
+es `write` para triggers confiables, pero si algún día se agrega un trigger
+influenciable por terceros el default baja a `read` y los guardados fallan en
+silencio (con warning, sin romper el job). Declararlo deja el contrato visible.
+
 **No subir `logs/` completo como artifact.** `market-probe.json` pesa 185 KB de
 estado del jugador y `runner.log` 378 KB. En un repo público un artifact es
 descargable por cualquiera con la URL. El workflow sube solo `runner.log` y
