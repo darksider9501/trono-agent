@@ -86,9 +86,12 @@ jobs:
           if [ -f package.json ]; then npm ci; else echo "sin dependencias"; fi
 
       # state/ y logs/ son efimeros en un runner. Se restauran de un cache para
-      # conservar session.json y learning.json entre jobs. La clave lleva el
-      # numero de corrida porque GitHub cachea inmutable: sin esto el segundo
-      # job nunca veria el estado escrito por el primero.
+      # conservar learning.json, control.json y el historial entre jobs. La clave
+      # lleva el numero de corrida porque GitHub cachea inmutable: sin esto el
+      # segundo job nunca veria el estado escrito por el primero.
+      #
+      # session.json queda FUERA del cache a proposito (ver el purge de abajo).
+      # Consecuencia aceptada: cada job hace su propio login headless.
       - name: Restore state
         uses: actions/cache/restore@v4
         with:
