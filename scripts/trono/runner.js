@@ -57,6 +57,31 @@ const loopSeconds = loopArg
   : parseInt(process.env.TRONO_LOOP || '0', 10) || 0;
 
 /**
+ * Presupuesto de tiempo del proceso, en minutos. 0 = sin limite (systemd).
+ *
+ * Existe porque un runner efimero (GitHub Actions) mata el job a las 6 h sin
+ * avisar, y un SIGKILL a mitad de pelea deja el lock tomado y el estado a
+ * medias. Con esto el agente sale solo un rato antes, por el camino normal:
+ * el `finally` libera el lock y escribe el ticker `stopped`.
+ *
+ * Se comprueba en la cabecera del loop, nunca a mitad de un tick, para no
+ * cortar una pelea ya enviada.
+ */
+const maxMinArg = args.find((a) => a.startsWith('--max-minutes='));
+const MAX_MINUTES = Math.max(
+  0,
+  maxMinArg
+    ? parseInt(maxMinArg.split('=')[1], 10) || 0
+    : parseInt(process.env.TRONO_MAX_MINUTES || '0', 10) || 0,
+);
+const DEADLINE = MAX_MINUTES > 0 ? Date.now() + MAX_MINUTES * 60000 : Infinity;
+
+/** Milisegundos que quedan de presupuesto. Infinity si no hay limite. */
+function remainingMs() {
+  return DEADLINE === Infinity ? Infinity : Math.max(0, DEADLINE - Date.now());
+}
+
+/**
  * Potion crafting spends gold, and gold is human territory.
  *
  * The cap is an explicit environment variable that defaults to 0, which keeps the whole
@@ -838,7 +863,11 @@ async function recover(g) {
     const s0 = quiet.state();
     if (s0.quiet) {
       log(`horario de silencio: sin requests hasta ${quiet.fmtMs(s0.until)} (${quiet.tzLabel()})`);
-      await quiet.sleepWhileQuiet();
+      await quiet.sleepWhileQuiet(DEADLINE === Infinity ? {} : { deadline: DEADLINE });
+      if (remainingMs() <= 0) {
+        log(`presupuesto de ${MAX_MINUTES} min agotado durante el silencio — saliendo sin requests`);
+        process.exit(0);
+      }
     }
   }
 
@@ -893,6 +922,13 @@ async function recover(g) {
     let pausedLogged = false;
 
     for (;;) {
+      // Presupuesto agotado: salir por el camino normal ANTES de empezar otro
+      // tick. Nunca a mitad de uno: cortar una pelea ya enviada deja el estado
+      // del juego y el nuestro desincronizados.
+      if (remainingMs() <= 0) {
+        log(`presupuesto de ${MAX_MINUTES} min agotado — saliendo limpio (tick ${ticks})`);
+        break;
+      }
       // Si la nube vuelve a estar viva, ceder el mando: dos dueños sobre la
       // misma cuenta se rotan el DTTSESS y los dos quedan en 401. Se consulta
       // cada minuto (tráfico local, cero requests al juego).
@@ -905,9 +941,20 @@ async function recover(g) {
       }
       if (quiet.state().quiet) {
         const s = quiet.state();
+        const rest = remainingMs();
+        if (rest !== Infinity && rest < 60000) {
+          log(`horario de silencio, pero quedan ${Math.round(rest / 1000)}s de presupuesto — saliendo limpio`);
+          break;
+        }
         log(`horario de silencio: sin requests hasta ${quiet.fmtMs(s.until)} (${quiet.tzLabel()}). Dormir...`);
         control.writeTicker({ tick: ticks, at: new Date().toISOString(), mode: MODE, state: 'quiet' });
-        await quiet.sleepWhileQuiet();
+        // sleepWhileQuiet no conoce el presupuesto: en un job efimero moriria
+        // de SIGKILL a mitad del silencio. Se le pasa el deadline.
+        await quiet.sleepWhileQuiet(DEADLINE === Infinity ? {} : { deadline: DEADLINE });
+        if (remainingMs() <= 0) {
+          log(`presupuesto de ${MAX_MINUTES} min agotado durante el silencio — saliendo limpio`);
+          break;
+        }
         continue;
       }
       if (control.readControl().paused) {
@@ -993,8 +1040,16 @@ async function recover(g) {
         }
       }
       if (!loopSeconds) break;
-      log(`sleeping ${loopSeconds}s`);
-      await sleep(loopSeconds * 1000);
+      // Dormir nunca mas alla del presupuesto restante: si quedan 40 s, no
+      // tiene sentido dormir 300 y que GitHub mate el job justo al despertar.
+      const rest = remainingMs();
+      const napMs = Math.min(loopSeconds * 1000, rest === Infinity ? Infinity : rest);
+      if (napMs <= 0) {
+        log(`presupuesto de ${MAX_MINUTES} min agotado — saliendo limpio (tick ${ticks})`);
+        break;
+      }
+      log(`sleeping ${Math.round(napMs / 1000)}s`);
+      await sleep(napMs);
     }
   } finally {
     try {

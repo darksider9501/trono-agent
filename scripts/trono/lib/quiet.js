@@ -290,14 +290,27 @@ function fmtMs(ms) {
   return `${fmt(p.t)} (${keyOf(p.y, p.m, p.d)})`;
 }
 
-async function sleepWhileQuiet() {
+/**
+ * Duerme mientras dure la ventana de silencio.
+ *
+ * `opts.deadline` (epoch ms) acota la espera: el proceso puede tener un
+ * presupuesto de vida mas corto que la ventana, y en un runner efimero dormir
+ * de mas significa morir de SIGKILL sin liberar el lock. Al llegar al deadline
+ * devuelve el control; el que llama decide si sale.
+ */
+async function sleepWhileQuiet(opts = {}) {
+  const deadline = Number.isFinite(opts.deadline) ? opts.deadline : Infinity;
   for (;;) {
     const s = state();
     if (!s.quiet) return;
-    const ms = s.until === null ? 3600000 : Math.max(1000, s.until - Date.now());
+    const now = Date.now();
+    if (now >= deadline) return;
+    const untilWake = s.until === null ? 3600000 : Math.max(1000, s.until - now);
+    const room = deadline === Infinity ? untilWake : Math.min(untilWake, deadline - now);
+    if (room <= 0) return;
     // Trozos de 5 min: un resume humano o un cambio de reloj no esperan al
     // final de la ventana entera.
-    await new Promise((r) => setTimeout(r, Math.min(ms, 300000)));
+    await new Promise((r) => setTimeout(r, Math.min(room, 300000)));
   }
 }
 

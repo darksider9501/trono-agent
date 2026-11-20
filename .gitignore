@@ -4,6 +4,9 @@
 # relevant trees are re-included explicitly.
 *
 !/.gitignore
+!/.github/
+!/.github/workflows/
+!/.github/workflows/**
 !/scripts/
 !/scripts/lib/
 !/scripts/lib/**

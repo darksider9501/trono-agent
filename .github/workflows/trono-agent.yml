@@ -1,0 +1,157 @@
+# Agente de "Defiende el Trono" en GitHub Actions.
+#
+# Por que existe: la VM gratuita (Oracle) pide tarjeta y aplica OFAC. Actions no
+# pide tarjeta y es alcanzable desde Cuba. Lo que se gana en acceso se paga en
+# restricciones, y este archivo existe para respetarlas:
+#
+#   1. Un job de GitHub-hosted runner vive como maximo 6 h. No se puede tener un
+#      proceso eterno. Por eso el runner propio sabe salir solo
+#      (--max-minutes), con margen para liberar el lock y escribir el ticker.
+#   2. El cron minimo real es 5 min, y GitHub retrasa los jobs en horas pico
+#      (a veces 10-20 min). No es un reloj: es "arranca cuando pueda".
+#   3. El runner es EFIMERO. state/ y logs/ desaparecen con el. Si no se
+#      persisten fuera, el agente reloguea en cada job y el patron de logins se
+#      vuelve una huella peor que la que intentabamos evitar.
+#
+# Presupuesto de sesion: 4 jobs/dia x 5h45 de loop = ~23 h de cobertura. Las
+# horas sin job (huecos de cron) son ruido aceptable para un experimento.
+#
+# SECRETOS: TRONO_USER y TRONO_PASS van en Settings > Secrets. NUNCA en el
+# repo. El workflow los exporta como entorno; lib/credentials.js los lee de
+# ahi antes de tocar ~/.trono/credentials.json.
+
+name: trono-agent
+
+on:
+  # Cron en UTC. La ventana de dormancia (23:30-06:30 hora Cuba = UTC-4) la
+  # aplica el propio agente, no el cron: si dormir fuera cosa del cron, el
+  # agente no podria escribir el ticker y pareceria caido.
+  #
+  # Job cada 6 h, arrancando a las 07:00 UTC (03:00 Cuba, dentro del silencio:
+  # el job despierta, duerme y espera el fin de ventana sin emitir un request).
+  schedule:
+    - cron: '0 7,13,19,1 * * *'
+  workflow_dispatch: {}
+
+# Dos corridas nunca deben solaparse: dos logins sobre la misma cuenta se rotan
+# el DTTSESS y los dos quedan en 401. cancel-in-progress false porque matar un
+# job a mitad de pelea es peor que esperar.
+concurrency:
+  group: trono-agent
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    # 355 min = 5 h 55 min. GitHub corta a los 360 y un SIGKILL a mitad de tick
+    # deja el lock tomado. Se deja margen para el arranque, el checkout y el
+    # paso de persistencia.
+    timeout-minutes: 355
+
+    env:
+      TRONO_MODE: http
+      TRONO_LIVE: '1'
+      TRONO_ON_CLOUD: '1'
+      TRONO_LOOP: '300'
+      # 330 min de loop: sale solo 25 min antes del timeout del job.
+      TRONO_MAX_MINUTES: '330'
+      # Cap de crafteo: 300 de oro, decision humana. 0 lo apaga.
+      TRONO_CRAFT_MAX_GOLD: '300'
+      # Cuba mantiene el horario de verano permanente: UTC-4 fijo.
+      TRONO_TZ_OFFSET_MIN: '-240'
+      TRONO_QUIET: '1'
+      TRONO_USER: ${{ secrets.TRONO_USER }}
+      TRONO_PASS: ${{ secrets.TRONO_PASS }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # El agente tiene 0 dependencias npm. Si algun dia deja de ser cierto,
+      # esto lo protege.
+      - name: Install (only if package.json exists)
+        run: |
+          if [ -f package.json ]; then npm ci; else echo "sin dependencias"; fi
+
+      # state/ y logs/ son efimeros en un runner. Se restauran de un cache para
+      # conservar session.json y learning.json entre jobs. La clave lleva el
+      # numero de corrida porque GitHub cachea inmutable: sin esto el segundo
+      # job nunca veria el estado escrito por el primero.
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            scripts/trono/state
+            scripts/trono/logs
+          key: trono-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            trono-state-
+
+      - name: Run agent
+        run: |
+          set -euo pipefail
+          cd scripts/trono
+          # Un lock es estado LOCAL de la maquina, nunca del proyecto. Si el job
+          # anterior murio por SIGKILL, su driver.lock viaja en el cache y llega
+          # a este runner, que es otra maquina con otro hostname y otro espacio
+          # de PIDs. Verificado contra lib/driverlock.js:
+          #
+          #   - si el pid del job anterior existe aca (colision: los runners
+          #     frescos usan PIDs bajos), alive() devuelve true
+          #   - sameMachine es false, asi que el TTL de 15 min NO aplica
+          #   - resultado: current() devuelve vivo incluso con beat de 35 min
+          #   - el agente ve "another driver is active" y sale al instante:
+          #     se pierden las 6 h del job
+          #
+          # Borrarlo es correcto porque `concurrency` ya garantiza que no hay
+          # otro job de este repo corriendo contra la misma cuenta.
+          #
+          # OJO: el lock vive en logs/, no en state/ (driverlock.js resuelve
+          # path.join(__dirname, '..', 'logs')).
+          rm -f logs/driver.lock state/driver.lock
+          mkdir -p state logs
+          node runner.js --live --loop="$TRONO_LOOP" --max-minutes="$TRONO_MAX_MINUTES"
+
+      # always(): si el agente muere a mitad de jornada, el session.json y el
+      # learning.json escritos hasta ese momento tienen que sobrevivir al job.
+      #
+      # El driver.lock vive en logs/ (no en state/) y se borra ANTES de guardar:
+      # ver el comentario del paso "Run agent". Un lock es estado de la maquina,
+      # no del proyecto.
+      - name: Drop machine-local lock before caching
+        if: always()
+        run: rm -f scripts/trono/logs/driver.lock scripts/trono/state/driver.lock
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            scripts/trono/state
+            scripts/trono/logs
+          key: trono-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # El log es la unica forma de ver que paso sin abrir el juego. Se sube
+      # siempre, incluso si el agente fallo: ahi esta el motivo.
+      #
+      # Se sube UN archivo, no el directorio. `logs/` acumula 600 KB de ruido
+      # (market-probe.json trae 185 KB de estado del jugador, player_state_raw
+      # el snapshot completo). En un repo publico un artifact es descargable por
+      # cualquiera con la URL: no tiene sentido publicar el estado crudo cuando
+      # lo unico que se necesita para diagnosticar es runner.log.
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trono-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            scripts/trono/logs/runner.log
+            scripts/trono/state/ticker.json
+          retention-days: 7
+          if-no-files-found: warn
