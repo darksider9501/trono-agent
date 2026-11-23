@@ -44,6 +44,11 @@ on:
         required: false
         default: ''
         type: string
+      clear_halt:
+        description: 'Liberar un SECURITY HALT. Escribi QUE VISTE al abrir el juego (minimo 10 chars). Vacio = no tocar.'
+        required: false
+        default: ''
+        type: string
 
 # Dos corridas nunca deben solaparse: dos logins sobre la misma cuenta se rotan
 # el DTTSESS y los dos quedan en 401. cancel-in-progress false porque matar un
@@ -118,9 +123,28 @@ jobs:
             trono-state-
 
       - name: Run agent
+        # El ack va por `env`, NO interpolado en el `run:`. GitHub Actions no
+        # escapa el contenido de `inputs.*`: escribirlo dentro del script deja
+        # que el texto del input se ejecute como shell (script injection). El
+        # input es humano, pero un humano tambien pega cosas sin mirar.
+        env:
+          TRONO_CLEAR_HALT: ${{ inputs.clear_halt }}
         run: |
           set -euo pipefail
           cd scripts/trono
+
+          # Liberar un SECURITY HALT es decision HUMANA, por eso no hay forma de
+          # que el agente lo haga solo: si el halt se pudiera levantar sin que
+          # nadie mirara el juego, no seria un freno, seria un reintento.
+          #
+          # El halt vive en state/ y viaja en el cache, asi que limpiarlo desde
+          # la maquina local no sirve: hay que hacerlo EN el runner. El texto
+          # que se exige es la evidencia de que alguien abrio el juego.
+          if [ -n "${TRONO_CLEAR_HALT:-}" ]; then
+            echo "liberando SECURITY HALT con evidencia humana"
+            node tools/clear-halt.js --ack="$TRONO_CLEAR_HALT"
+          fi
+
           # Un lock es estado LOCAL de la maquina, nunca del proyecto. Si el job
           # anterior murio por SIGKILL, su driver.lock viaja en el cache y llega
           # a este runner, que es otra maquina con otro hostname y otro espacio
@@ -140,6 +164,17 @@ jobs:
           # path.join(__dirname, '..', 'logs')).
           rm -f logs/driver.lock state/driver.lock
           mkdir -p state logs
+
+          # SECURITY HALT: si sigue activo, este job muere en 0s con exit 3 y el
+          # cron dispara otro a las 6 h que tambien muere. Sin este aviso, la
+          # unica forma de enterarse es leer el log de un job fallido.
+          if [ -f state/halt.json ]; then
+            echo "::error::SECURITY HALT activo en el cache. Nada corre hasta que un humano lo libere."
+            echo "::error::Abri el juego vos, mira que muestra, y relanza con clear_halt='<lo que viste>'."
+            node tools/clear-halt.js || true
+            exit 3
+          fi
+
           node runner.js --live --loop="$TRONO_LOOP" --max-minutes="$TRONO_MAX_MINUTES"
 
       # always(): si el agente muere a mitad de jornada, el session.json y el

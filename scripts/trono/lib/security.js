@@ -90,6 +90,26 @@ const STATUS_SIGNALS = {
 };
 
 /**
+ * Un 503 (o 502/504) con CUERPO VACIO es el servidor del juego caido, no un gate.
+ *
+ * Medido el 2026-11-22: el farm se detuvo un dia entero por un
+ * `POST /api/session_activity.php` que devolvio `503` con 0 bytes. Ningun gate
+ * de bots responde 0 bytes: Cloudflare escribe "Just a moment...", DataDome
+ * escribe su HTML, PerimeterX escribe su script. Un 5xx vacio es un proceso PHP
+ * que se murio detrás del servidor web, y el juego se recupera solo.
+ *
+ * Antes esto era indistinguible de un bloqueo y exigia que un humano lo
+ * liberara, asi que un parpadeo de 2 segundos del servidor costaba un dia de
+ * farm. Es exactamente el mismo error que ya se corrigio para el mantenimiento
+ * (ver MaintenanceWindow): tratarlo como espera, no como deteccion.
+ *
+ * NO se extiende a 403 ni 429: esos SI son un gate, y un 403 vacio sigue
+ * siendo "algo nuevo se interpuso". Solo el 5xx es territorio del servidor.
+ */
+const SERVER_FLAP = new Set([500, 502, 503, 504]);
+
+
+/**
  * The game's own maintenance flag, which is the one 503 that is not a gate.
  *
  * `"maintenance":true` is unambiguous: no bot-management layer writes our JSON.
@@ -241,6 +261,16 @@ function inspect({ where, url, status, text, headers }) {
   ) {
     throw new MaintenanceWindow(
       `MAINTENANCE: ${where} returned ${status || 'no status'} — the game is down on its own schedule`,
+      { where, status }
+    );
+  }
+
+  // Un 5xx con cuerpo vacio: el servidor se cayo, no hay gate delante.
+  // Ningun WAF contesta 0 bytes. Se trata como ventana de mantenimiento
+  // (reintentable, sin halt) en vez de como deteccion.
+  if (SERVER_FLAP.has(status) && body.length === 0) {
+    throw new MaintenanceWindow(
+      `SERVER FLAP: ${where} returned ${status} with an empty body — the game's own server, not a gate`,
       { where, status }
     );
   }

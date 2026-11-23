@@ -144,6 +144,60 @@ check('clear archives the record and unblocks', () => {
   security.assertClear('test');
 });
 
+// Regresion del 2026-11-22: un 503 con 0 bytes tumbo el farm un dia entero.
+// El servidor del juego se cayo dos segundos; ningun WAF contesta 0 bytes.
+check('an empty 5xx is a server flap, not a gate', () => {
+  for (const status of [500, 502, 503, 504]) {
+    security.clear({ ack: 'selftest reset' });
+    let threw = null;
+    try {
+      security.inspect({ where: 'POST /api/session_activity.php', status, text: '' });
+    } catch (e) {
+      threw = e;
+    }
+    assert(threw, `${status} with empty body did not throw at all`);
+    assert(
+      threw.code === 'MAINTENANCE',
+      `${status} empty body threw ${threw.code || threw.name}, expected MAINTENANCE`
+    );
+    assert(security.isHalted() === false, `${status} empty body wrote a halt file`);
+  }
+});
+
+// ...pero un 5xx NO es un pase libre: si el cuerpo trae la firma de un WAF,
+// el gate gana. Este es el orden que hace segura la regla de arriba.
+check('a 5xx carrying gate markers still halts', () => {
+  security.clear({ ack: 'selftest reset' });
+  expectHalt(
+    () => security.inspect({ where: 'fetchPage /', status: 503, text: '<title>Just a moment...</title>' }),
+    '503 + cloudflare challenge'
+  );
+  assert(security.readHalt().signals.includes('cloudflare-challenge'), 'lost the cloudflare signal');
+
+  security.clear({ ack: 'selftest reset' });
+  expectHalt(
+    () => security.inspect({ where: 'fetchPage /', status: 503, text: '<script src="https://js.datadome.co/tags.js"></script>' }),
+    '503 + datadome'
+  );
+
+  // Y un 503 vacio con cabecera de Cloudflare tampoco pasa: la cabecera es
+  // evidencia de que hay un edge delante, aunque el cuerpo venga en blanco.
+  security.clear({ ack: 'selftest reset' });
+  expectHalt(
+    () => security.inspect({ where: 'fetchPage /', status: 503, text: '', headers: { server: 'cloudflare' } }),
+    '503 empty + cloudflare header'
+  );
+});
+
+// Un 4xx vacio NO es un flap: 403/429 son exactamente como un gate contesta.
+check('an empty 4xx still halts', () => {
+  for (const status of [403, 429]) {
+    security.clear({ ack: 'selftest reset' });
+    expectHalt(() => security.inspect({ where: 'apiGet /api/player_state.php', status, text: '' }), `${status} empty`);
+    assert(security.isHalted() === true, `${status} empty body did not halt`);
+  }
+});
+
 // Cleanup: the test owns TMP, and its logs land in the project logs dir only if
 // the module wrote there. Keep the throwaway dir small but leave the archive for
 // inspection when something fails.
