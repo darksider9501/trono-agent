@@ -198,6 +198,52 @@ check('an empty 4xx still halts', () => {
   }
 });
 
+// `supersedeObsoleteHalt` es la UNICA puerta que libera un halt sin un humano.
+// Solo puede coincidir con el falso positivo del 22-nov (5xx + 0 bytes +
+// signal unico + ruta del juego). Cualquier halt real tiene que quedar intacto.
+check('supersede frees only the obsolete empty-5xx halt', () => {
+  const writeHalt = (rec) => {
+    security.clear({ ack: 'selftest reset' });
+    fs.writeFileSync(
+      security.HALT_PATH,
+      JSON.stringify({ halted: true, at: new Date().toISOString(), url: null, cookies: null, ...rec }),
+      'utf8'
+    );
+  };
+
+  // Debe liberar: el caso real.
+  writeHalt({ where: 'POST /api/session_activity.php', status: 503, signals: ['service-unavailable'], excerpt: '' });
+  assert(security.supersedeObsoleteHalt() !== null, 'did not free the real false positive');
+  assert(security.isHalted() === false, 'still halted after supersede');
+
+  // No debe liberar: un gate real que ademas era 5xx.
+  writeHalt({
+    where: 'fetchPage /',
+    status: 503,
+    signals: ['cloudflare-challenge', 'service-unavailable'],
+    excerpt: '<title>Just a moment...</title>'
+  });
+  assert(security.supersedeObsoleteHalt() === null, 'freed a halt carrying a strong gate marker');
+  assert(security.isHalted() === true, 'a real gate stopped halting');
+
+  // No debe liberar: mismo signal pero con cuerpo (el juego explicandose).
+  writeHalt({
+    where: 'POST /api/session_activity.php',
+    status: 503,
+    signals: ['service-unavailable'],
+    excerpt: '{"ok":false,"maintenance":true}'
+  });
+  assert(security.supersedeObsoleteHalt() === null, 'freed a halt that had body evidence');
+  assert(security.isHalted() === true, 'a halt with evidence stopped halting');
+
+  // No debe liberar: 403 vacio (un gate no escribe cuerpo).
+  writeHalt({ where: 'apiGet /api/player_state.php', status: 403, signals: ['forbidden'], excerpt: '' });
+  assert(security.supersedeObsoleteHalt() === null, 'freed a 403');
+  assert(security.isHalted() === true, 'a 403 stopped halting');
+
+  security.clear({ ack: 'selftest reset' });
+});
+
 // Cleanup: the test owns TMP, and its logs land in the project logs dir only if
 // the module wrote there. Keep the throwaway dir small but leave the archive for
 // inspection when something fails.

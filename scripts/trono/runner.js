@@ -840,6 +840,14 @@ async function recover(g) {
 (async () => {
   // A halt survives restarts on purpose: the Hub restarts this process, and a
   // restart must not look like the human approving what was just detected.
+  //
+  // Excepcion unica y acotada: un halt que escribio el clasificador ANTERIOR al
+  // 2026-11-23 para un 5xx con cuerpo vacio. Ese halt vive en el cache de
+  // Actions, el job muere en 0s antes de poder limpiarlo, y por lo tanto jamas
+  // se libera solo. `supersedeObsoleteHalt` solo lo toca si el codigo actual es
+  // incapaz de reproducirlo (ver el predicado en lib/security.js).
+  security.supersedeObsoleteHalt();
+
   const halt = security.readHalt();
   if (halt) {
     log(

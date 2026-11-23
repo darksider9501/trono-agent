@@ -166,6 +166,62 @@ function isHalted() {
   return !!readHalt();
 }
 
+/**
+ * Supersede un halt que escribio un clasificador que ya demostramos defectuoso.
+ *
+ * NO es un auto-clear. Es una migracion con un predicado ESTRICTO: solo libera
+ * un halt que el codigo actual es incapaz de volver a producir.
+ *
+ * El 2026-11-22 un `POST /api/session_activity.php` devolvio 503 con 0 bytes y
+ * el breaker lo clasifico como `service-unavailable` -> halt. Ese halt quedo
+ * escrito en el cache de Actions y bloquea todos los jobs futuros: el job muere
+ * en 0s antes de poder hacer nada, asi que NUNCA se limpia solo. El agente
+ * estuvo muerto ~10 h por un parpadeo de dos segundos del servidor del juego.
+ *
+ * El predicado exige las CUATRO condiciones a la vez, y cada una es necesaria:
+ *
+ *   1. signals es EXACTAMENTE ['service-unavailable']. Un solo marcador fuerte
+ *      mas (cloudflare-challenge, datadome, bot-cookie:*) y no aplica: eso si
+ *      seria un gate, y los marcadores fuertes se evaluan ANTES del flap.
+ *   2. status es 5xx. Un 503 legitimo del juego con WAF delante trae cuerpo.
+ *   3. excerpt vacio. Un gate SIEMPRE escribe algo: Cloudflare "Just a moment",
+ *      DataDome su HTML. 0 bytes es un proceso PHP muriendose.
+ *   4. `where` es una ruta del juego, no un probe de conexion.
+ *
+ * Si algo no calza, NO toca nada y devuelve null: el humano sigue siendo el
+ * unico que puede liberar un halt de verdad. Lo que se archiva queda en
+ * logs/security-halt.cleared.log con el motivo, asi que el episodio es auditable.
+ */
+function supersedeObsoleteHalt() {
+  const halt = readHalt();
+  if (!halt) return null;
+
+  const signals = Array.isArray(halt.signals) ? halt.signals : [];
+  const status = Number(halt.status);
+  const excerpt = String(halt.excerpt || '').trim();
+
+  const onlyServiceUnavailable = signals.length === 1 && signals[0] === 'service-unavailable';
+  const is5xx = Number.isFinite(status) && status >= 500 && status <= 599;
+  const emptyBody = excerpt.length === 0;
+  const gameRoute = /^[a-z]*\s*\/api\/|^fetchPage\s|^apiGet\s|^apiPost\s/i.test(String(halt.where || ''));
+
+  if (!onlyServiceUnavailable || !is5xx || !emptyBody || !gameRoute) return null;
+
+  const archived = clear({
+    ack:
+      `superseded: ${halt.where} answered ${status} with an empty body, which the ` +
+      'pre-2026-11-23 classifier read as a gate. A WAF never answers 0 bytes; ' +
+      'this was the game\'s own server. The current classifier treats it as ' +
+      'MAINTENANCE and cannot produce this halt again.'
+  });
+
+  console.error(
+    `!! superseded obsolete halt (${halt.where} HTTP ${status}, empty body) - ` +
+      'false positive from the fixed classifier, archived to logs/security-halt.cleared.log'
+  );
+  return archived;
+}
+
 /** Loud, greppable line. The console watcher colours this one red. */
 function shout(msg) {
   console.error(`!! SECURITY HALT: ${msg}`);
@@ -344,6 +400,7 @@ module.exports = {
   MaintenanceWindow,
   readHalt,
   isHalted,
+  supersedeObsoleteHalt,
   assertClear,
   inspect,
   trip,

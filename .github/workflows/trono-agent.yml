@@ -168,6 +168,16 @@ jobs:
           # SECURITY HALT: si sigue activo, este job muere en 0s con exit 3 y el
           # cron dispara otro a las 6 h que tambien muere. Sin este aviso, la
           # unica forma de enterarse es leer el log de un job fallido.
+          #
+          # Antes del aviso se le da al runner la chance de superar un halt que
+          # escribio el clasificador ANTERIOR al 2026-11-23 (5xx con 0 bytes). Ese
+          # halt vive en el cache y nada lo limpia solo: el job muere en 0s antes
+          # de poder hacer nada, asi que sin esto el agente queda muerto para
+          # siempre. El predicado es estricto y solo coincide con lo que el codigo
+          # actual es incapaz de producir; ver `supersedeObsoleteHalt` en
+          # lib/security.js. Un halt de verdad NO se toca.
+          node -e "const s=require('./lib/security');const r=s.supersedeObsoleteHalt();if(r)console.log('halt obsoleto liberado: '+r.where+' HTTP '+r.status)"
+
           if [ -f state/halt.json ]; then
             echo "::error::SECURITY HALT activo en el cache. Nada corre hasta que un humano lo libere."
             echo "::error::Abri el juego vos, mira que muestra, y relanza con clear_halt='<lo que viste>'."
