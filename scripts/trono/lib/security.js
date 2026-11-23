@@ -167,6 +167,28 @@ function isHalted() {
 }
 
 /**
+ * Por que el predicado no libero el halt. Solo para diagnostico: convierte un
+ * fallo opaco ("el job murio en 0s otra vez") en la lista de condiciones que
+ * fallaron, asi la proxima corrida se arregla sin adivinar.
+ */
+function explainObsoleteHalt(halt) {
+  if (!halt) return 'sin halt';
+  const signals = Array.isArray(halt.signals) ? halt.signals : [];
+  const status = Number(halt.status);
+  const excerpt = String(halt.excerpt || '').trim();
+  const reasons = [];
+  if (!(signals.length === 1 && signals[0] === 'service-unavailable')) {
+    reasons.push(`signals=${JSON.stringify(signals)} (se esperaba exactamente ["service-unavailable"])`);
+  }
+  if (!(Number.isFinite(status) && status >= 500 && status <= 599)) reasons.push(`status=${halt.status} (se esperaba 5xx)`);
+  if (excerpt.length !== 0) reasons.push(`excerpt no vacio (${excerpt.length} chars): ${JSON.stringify(excerpt.slice(0, 120))}`);
+  if (!/^[a-z]*\s*\/api\/|^fetchPage\s|^apiGet\s|^apiPost\s/i.test(String(halt.where || ''))) {
+    reasons.push(`where=${JSON.stringify(halt.where)} (no es una ruta del juego)`);
+  }
+  return reasons.length ? reasons.join(' | ') : 'todas las condiciones se cumplen (no deberia llegar aca)';
+}
+
+/**
  * Supersede un halt que escribio un clasificador que ya demostramos defectuoso.
  *
  * NO es un auto-clear. Es una migracion con un predicado ESTRICTO: solo libera
@@ -401,6 +423,7 @@ module.exports = {
   readHalt,
   isHalted,
   supersedeObsoleteHalt,
+  explainObsoleteHalt,
   assertClear,
   inspect,
   trip,

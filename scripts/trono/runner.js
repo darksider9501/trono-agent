@@ -853,6 +853,10 @@ async function recover(g) {
     log(
       `SECURITY HALT active — refusing to start. ${halt.where} at ${halt.at} :: ${(halt.signals || []).join(', ')}`
     );
+    // Si el halt sigue en pie, decir EXACTAMENTE por que el predicado no lo
+    // reconocio. Sin esto la proxima corrida muere igual de opaca y hay que
+    // adivinar que condicion fallo mirando un log de 0s.
+    log(`supersede rejected this halt: ${security.explainObsoleteHalt(halt)}`);
     log(`human must clear: node tools/clear-halt.js --ack="<what you found>"`);
     process.exit(3);
   }

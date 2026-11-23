@@ -176,7 +176,7 @@ jobs:
           # siempre. El predicado es estricto y solo coincide con lo que el codigo
           # actual es incapaz de producir; ver `supersedeObsoleteHalt` en
           # lib/security.js. Un halt de verdad NO se toca.
-          node -e "const s=require('./lib/security');const r=s.supersedeObsoleteHalt();if(r)console.log('halt obsoleto liberado: '+r.where+' HTTP '+r.status)"
+          node -e "const s=require('./lib/security');const h=s.readHalt();const r=s.supersedeObsoleteHalt();if(r){console.log('halt obsoleto liberado: '+r.where+' HTTP '+r.status);}else if(h){console.log('::warning::el halt NO es obsoleto: '+s.explainObsoleteHalt(h));}"
 
           if [ -f state/halt.json ]; then
             echo "::error::SECURITY HALT activo en el cache. Nada corre hasta que un humano lo libere."
