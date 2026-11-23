@@ -144,28 +144,55 @@ check('clear archives the record and unblocks', () => {
   security.assertClear('test');
 });
 
-// Regresion del 2026-11-22: un 503 con 0 bytes tumbo el farm un dia entero.
-// El servidor del juego se cayo dos segundos; ningun WAF contesta 0 bytes.
-check('an empty 5xx is a server flap, not a gate', () => {
-  for (const status of [500, 502, 503, 504]) {
+// Regresion del 2026-11-22: el farm se detuvo un dia entero por la pagina de
+// error por defecto del hosting (503, XHTML 1.0 Transitional, <title></title>
+// vacio, solo un <style> inline, 370 bytes). No es un gate: ningun WAF contesta
+// un documento sin una sola palabra visible.
+check('a message-less 5xx is a server flap, not a gate', () => {
+  const realPage =
+    '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd"> ' +
+    '<html xmlns="http://www.w3.org/1999/xhtml"> <head> <meta http-equiv="Content-Type" content="text/html; charset=utf-8" /> ' +
+    '<title></title> <style type="text/css"> html{ } body{ mar';
+
+  // La pagina REAL del halt, y los casos degenerados equivalentes.
+  for (const [status, body] of [
+    [503, realPage],
+    [500, ''],
+    [502, ''],
+    [504, '<html><head><title></title></head><body></body></html>'],
+    [503, '   \n\t  ']
+  ]) {
     security.clear({ ack: 'selftest reset' });
     let threw = null;
     try {
-      security.inspect({ where: 'POST /api/session_activity.php', status, text: '' });
+      security.inspect({ where: 'POST /api/session_activity.php', status, text: body });
     } catch (e) {
       threw = e;
     }
-    assert(threw, `${status} with empty body did not throw at all`);
+    assert(threw, `${status} len=${body.length} did not throw at all`);
     assert(
       threw.code === 'MAINTENANCE',
-      `${status} empty body threw ${threw.code || threw.name}, expected MAINTENANCE`
+      `${status} len=${body.length} threw ${threw.code || threw.name}, expected MAINTENANCE`
     );
-    assert(security.isHalted() === false, `${status} empty body wrote a halt file`);
+    assert(security.isHalted() === false, `${status} len=${body.length} wrote a halt file`);
   }
 });
 
-// ...pero un 5xx NO es un pase libre: si el cuerpo trae la firma de un WAF,
-// el gate gana. Este es el orden que hace segura la regla de arriba.
+// Un 5xx que SI dice algo no es un flap: el gate gana. Este es el limite que
+// hace segura la regla de arriba, porque un WAF siempre escribe palabras.
+check('a 5xx that says something still halts', () => {
+  for (const body of [
+    '<html><head><title>Just a moment...</title></head><body>Checking your browser</body></html>',
+    '<html><body><h1>Access denied</h1><p>You do not have permission to access this resource.</p></body></html>',
+    '<html><body>Request blocked by our security policy. Contact support.</body></html>'
+  ]) {
+    security.clear({ ack: 'selftest reset' });
+    expectHalt(() => security.inspect({ where: 'POST /api/session_activity.php', status: 503, text: body }), '503 + words');
+    assert(security.isHalted() === true, `did not halt on: ${body.slice(0, 40)}`);
+  }
+});
+
+// ...y si trae la firma de un WAF, el gate gana incluso sin texto visible.
 check('a 5xx carrying gate markers still halts', () => {
   security.clear({ ack: 'selftest reset' });
   expectHalt(
@@ -180,8 +207,8 @@ check('a 5xx carrying gate markers still halts', () => {
     '503 + datadome'
   );
 
-  // Y un 503 vacio con cabecera de Cloudflare tampoco pasa: la cabecera es
-  // evidencia de que hay un edge delante, aunque el cuerpo venga en blanco.
+  // La cabecera es evidencia de que hay un edge delante, aunque el cuerpo venga
+  // en blanco: ahi si importa el status, no el texto.
   security.clear({ ack: 'selftest reset' });
   expectHalt(
     () => security.inspect({ where: 'fetchPage /', status: 503, text: '', headers: { server: 'cloudflare' } }),
@@ -189,7 +216,7 @@ check('a 5xx carrying gate markers still halts', () => {
   );
 });
 
-// Un 4xx vacio NO es un flap: 403/429 son exactamente como un gate contesta.
+// Un 4xx NO es un flap, ni siquiera vacio: 403/429 son como un gate contesta.
 check('an empty 4xx still halts', () => {
   for (const status of [403, 429]) {
     security.clear({ ack: 'selftest reset' });
@@ -199,9 +226,15 @@ check('an empty 4xx still halts', () => {
 });
 
 // `supersedeObsoleteHalt` es la UNICA puerta que libera un halt sin un humano.
-// Solo puede coincidir con el falso positivo del 22-nov (5xx + 0 bytes +
-// signal unico + ruta del juego). Cualquier halt real tiene que quedar intacto.
-check('supersede frees only the obsolete empty-5xx halt', () => {
+// Solo puede coincidir con el falso positivo del 22-nov: un 5xx cuya pagina no
+// dice una sola palabra, con signal unico y en una ruta del juego. Cualquier
+// halt real tiene que quedar intacto.
+check('supersede frees only the obsolete message-less 5xx halt', () => {
+  const realPage =
+    '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd"> ' +
+    '<html xmlns="http://www.w3.org/1999/xhtml"> <head> <meta http-equiv="Content-Type" content="text/html; charset=utf-8" /> ' +
+    '<title></title> <style type="text/css"> html{ } body{ mar';
+
   const writeHalt = (rec) => {
     security.clear({ ack: 'selftest reset' });
     fs.writeFileSync(
@@ -211,10 +244,15 @@ check('supersede frees only the obsolete empty-5xx halt', () => {
     );
   };
 
-  // Debe liberar: el caso real.
-  writeHalt({ where: 'POST /api/session_activity.php', status: 503, signals: ['service-unavailable'], excerpt: '' });
+  // Debe liberar: el caso real, con sus 370 bytes de XHTML mudo.
+  writeHalt({ where: 'POST /api/session_activity.php', status: 503, signals: ['service-unavailable'], excerpt: realPage });
   assert(security.supersedeObsoleteHalt() !== null, 'did not free the real false positive');
   assert(security.isHalted() === false, 'still halted after supersede');
+
+  // Debe liberar: cuerpo realmente vacio (misma clase de fallo).
+  writeHalt({ where: 'POST /api/tick.php', status: 500, signals: ['service-unavailable'], excerpt: '' });
+  assert(security.supersedeObsoleteHalt() !== null, 'did not free an empty-body 500');
+  assert(security.isHalted() === false, 'still halted after supersede (empty)');
 
   // No debe liberar: un gate real que ademas era 5xx.
   writeHalt({
@@ -226,17 +264,17 @@ check('supersede frees only the obsolete empty-5xx halt', () => {
   assert(security.supersedeObsoleteHalt() === null, 'freed a halt carrying a strong gate marker');
   assert(security.isHalted() === true, 'a real gate stopped halting');
 
-  // No debe liberar: mismo signal pero con cuerpo (el juego explicandose).
+  // No debe liberar: el cuerpo SI dice algo (aunque no sea un marcador fuerte).
   writeHalt({
     where: 'POST /api/session_activity.php',
     status: 503,
     signals: ['service-unavailable'],
-    excerpt: '{"ok":false,"maintenance":true}'
+    excerpt: '<html><body><h1>Access denied</h1><p>You do not have permission.</p></body></html>'
   });
-  assert(security.supersedeObsoleteHalt() === null, 'freed a halt that had body evidence');
-  assert(security.isHalted() === true, 'a halt with evidence stopped halting');
+  assert(security.supersedeObsoleteHalt() === null, 'freed a halt whose body said something');
+  assert(security.isHalted() === true, 'a halt with a message stopped halting');
 
-  // No debe liberar: 403 vacio (un gate no escribe cuerpo).
+  // No debe liberar: 403 vacio (un gate no es 5xx).
   writeHalt({ where: 'apiGet /api/player_state.php', status: 403, signals: ['forbidden'], excerpt: '' });
   assert(security.supersedeObsoleteHalt() === null, 'freed a 403');
   assert(security.isHalted() === true, 'a 403 stopped halting');

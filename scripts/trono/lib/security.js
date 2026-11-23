@@ -90,23 +90,57 @@ const STATUS_SIGNALS = {
 };
 
 /**
- * Un 503 (o 502/504) con CUERPO VACIO es el servidor del juego caido, no un gate.
+ * Un 5xx que no dice NADA es la pagina de error del hosting, no un gate.
  *
  * Medido el 2026-11-22: el farm se detuvo un dia entero por un
- * `POST /api/session_activity.php` que devolvio `503` con 0 bytes. Ningun gate
- * de bots responde 0 bytes: Cloudflare escribe "Just a moment...", DataDome
- * escribe su HTML, PerimeterX escribe su script. Un 5xx vacio es un proceso PHP
- * que se murio detrás del servidor web, y el juego se recupera solo.
+ * `POST /api/session_activity.php` que devolvio 503 con esta pagina (370 bytes):
  *
- * Antes esto era indistinguible de un bloqueo y exigia que un humano lo
- * liberara, asi que un parpadeo de 2 segundos del servidor costaba un dia de
- * farm. Es exactamente el mismo error que ya se corrigio para el mantenimiento
- * (ver MaintenanceWindow): tratarlo como espera, no como deteccion.
+ *   <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" ...>
+ *   <html xmlns="http://www.w3.org/1999/xhtml"><head>
+ *   <meta http-equiv="Content-Type" ... />
+ *   <title></title>                    <-- TITULO VACIO
+ *   <style type="text/css"> html{ } body{ mar...
  *
- * NO se extiende a 403 ni 429: esos SI son un gate, y un 403 vacio sigue
- * siendo "algo nuevo se interpuso". Solo el 5xx es territorio del servidor.
+ * Es el documento de error por defecto de un panel de hosting: XHTML 1.0
+ * Transitional, un <style> inline, titulo vacio y CERO texto visible.
+ *
+ * La primera correccion solo miraba `body.length === 0`, asi que esta pagina de
+ * 370 bytes la esquivaba y volvia a haltear. La distincion correcta no es "cuerpo
+ * vacio", es "cuerpo que no dice nada": todo gate conocido ESCRIBE palabras
+ * ("Just a moment...", "Access denied", "checking your browser", un captcha).
+ * Un HTML sin texto visible es el servidor fallando, y nunca un gate.
+ *
+ * NO se extiende a 403 ni 429: esos SI son un gate. Solo el 5xx es territorio
+ * del servidor.
  */
 const SERVER_FLAP = new Set([500, 502, 503, 504]);
+
+/** Debajo de esto, un HTML no le esta diciendo nada a nadie. */
+const MIN_VISIBLE_TEXT = 20;
+
+/**
+ * El texto que un humano VERIA en ese HTML.
+ *
+ * Quita <script>, <style>, comentarios, etiquetas y entidades. Tolera etiquetas
+ * sin cerrar a proposito: el excerpt que se guarda esta cortado a 400 chars, asi
+ * que un <style> puede venir truncado y sin su `</style>`.
+ */
+function visibleText(html) {
+  return String(html || '')
+    .replace(/<script\b[^>]*>[\s\S]*?(?:<\/script>|$)/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?(?:<\/style>|$)/gi, ' ')
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, ' ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&[a-z#0-9]+;/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Un 5xx cuya pagina no contiene ni un mensaje: documento de error del server. */
+function isServerErrorDocument(status, body) {
+  if (!SERVER_FLAP.has(status)) return false;
+  return visibleText(body).length < MIN_VISIBLE_TEXT;
+}
 
 
 /**
@@ -176,12 +210,15 @@ function explainObsoleteHalt(halt) {
   const signals = Array.isArray(halt.signals) ? halt.signals : [];
   const status = Number(halt.status);
   const excerpt = String(halt.excerpt || '').trim();
+  const visible = visibleText(excerpt);
   const reasons = [];
   if (!(signals.length === 1 && signals[0] === 'service-unavailable')) {
     reasons.push(`signals=${JSON.stringify(signals)} (se esperaba exactamente ["service-unavailable"])`);
   }
   if (!(Number.isFinite(status) && status >= 500 && status <= 599)) reasons.push(`status=${halt.status} (se esperaba 5xx)`);
-  if (excerpt.length !== 0) reasons.push(`excerpt no vacio (${excerpt.length} chars): ${JSON.stringify(excerpt.slice(0, 120))}`);
+  if (visible.length >= MIN_VISIBLE_TEXT) {
+    reasons.push(`el cuerpo SI dice algo (${visible.length} chars visibles): ${JSON.stringify(visible.slice(0, 120))}`);
+  }
   if (!/^[a-z]*\s*\/api\/|^fetchPage\s|^apiGet\s|^apiPost\s/i.test(String(halt.where || ''))) {
     reasons.push(`where=${JSON.stringify(halt.where)} (no es una ruta del juego)`);
   }
@@ -194,11 +231,12 @@ function explainObsoleteHalt(halt) {
  * NO es un auto-clear. Es una migracion con un predicado ESTRICTO: solo libera
  * un halt que el codigo actual es incapaz de volver a producir.
  *
- * El 2026-11-22 un `POST /api/session_activity.php` devolvio 503 con 0 bytes y
- * el breaker lo clasifico como `service-unavailable` -> halt. Ese halt quedo
- * escrito en el cache de Actions y bloquea todos los jobs futuros: el job muere
- * en 0s antes de poder hacer nada, asi que NUNCA se limpia solo. El agente
- * estuvo muerto ~10 h por un parpadeo de dos segundos del servidor del juego.
+ * El 2026-11-22 un `POST /api/session_activity.php` devolvio 503 con la pagina
+ * de error por defecto del hosting (XHTML 1.0 Transitional, `<title></title>`
+ * vacio, solo un <style> inline, 370 bytes y CERO texto visible). El breaker lo
+ * clasifico como `service-unavailable` -> halt. Ese halt quedo escrito en el
+ * cache de Actions y bloquea todos los jobs futuros: el job muere en 0s antes de
+ * poder hacer nada, asi que NUNCA se limpia solo.
  *
  * El predicado exige las CUATRO condiciones a la vez, y cada una es necesaria:
  *
@@ -206,8 +244,11 @@ function explainObsoleteHalt(halt) {
  *      mas (cloudflare-challenge, datadome, bot-cookie:*) y no aplica: eso si
  *      seria un gate, y los marcadores fuertes se evaluan ANTES del flap.
  *   2. status es 5xx. Un 503 legitimo del juego con WAF delante trae cuerpo.
- *   3. excerpt vacio. Un gate SIEMPRE escribe algo: Cloudflare "Just a moment",
- *      DataDome su HTML. 0 bytes es un proceso PHP muriendose.
+ *   3. El cuerpo NO DICE NADA (menos de MIN_VISIBLE_TEXT chars visibles). Un
+ *      gate SIEMPRE escribe palabras: "Just a moment...", "Access denied",
+ *      "checking your browser". Un <title> vacio con solo CSS es el hosting
+ *      fallando. El excerpt guardado esta cortado a 400 chars, asi que un
+ *      <style> puede venir truncado y sin cerrar: `visibleText` lo tolera.
  *   4. `where` es una ruta del juego, no un probe de conexion.
  *
  * Si algo no calza, NO toca nada y devuelve null: el humano sigue siendo el
@@ -224,21 +265,21 @@ function supersedeObsoleteHalt() {
 
   const onlyServiceUnavailable = signals.length === 1 && signals[0] === 'service-unavailable';
   const is5xx = Number.isFinite(status) && status >= 500 && status <= 599;
-  const emptyBody = excerpt.length === 0;
+  const messageLess = visibleText(excerpt).length < MIN_VISIBLE_TEXT;
   const gameRoute = /^[a-z]*\s*\/api\/|^fetchPage\s|^apiGet\s|^apiPost\s/i.test(String(halt.where || ''));
 
-  if (!onlyServiceUnavailable || !is5xx || !emptyBody || !gameRoute) return null;
+  if (!onlyServiceUnavailable || !is5xx || !messageLess || !gameRoute) return null;
 
   const archived = clear({
     ack:
-      `superseded: ${halt.where} answered ${status} with an empty body, which the ` +
-      'pre-2026-11-23 classifier read as a gate. A WAF never answers 0 bytes; ' +
-      'this was the game\'s own server. The current classifier treats it as ' +
-      'MAINTENANCE and cannot produce this halt again.'
+      `superseded: ${halt.where} answered ${status} with a message-less error document, which the ` +
+      'pre-2026-11-23 classifier read as a gate. A WAF always writes words; an empty ' +
+      '<title> with only inline CSS is the hosting error page. The current classifier ' +
+      'treats it as MAINTENANCE and cannot produce this halt again.'
   });
 
   console.error(
-    `!! superseded obsolete halt (${halt.where} HTTP ${status}, empty body) - ` +
+    `!! superseded obsolete halt (${halt.where} HTTP ${status}, message-less error document) - ` +
       'false positive from the fixed classifier, archived to logs/security-halt.cleared.log'
   );
   return archived;
@@ -343,12 +384,12 @@ function inspect({ where, url, status, text, headers }) {
     );
   }
 
-  // Un 5xx con cuerpo vacio: el servidor se cayo, no hay gate delante.
-  // Ningun WAF contesta 0 bytes. Se trata como ventana de mantenimiento
-  // (reintentable, sin halt) en vez de como deteccion.
-  if (SERVER_FLAP.has(status) && body.length === 0) {
+  // Un 5xx que no dice nada: el documento de error del hosting, no un gate.
+  // Ver `isServerErrorDocument`: no alcanza con `length === 0`, porque la
+  // pagina real del 22-nov traia 370 bytes de XHTML con titulo vacio.
+  if (isServerErrorDocument(status, body)) {
     throw new MaintenanceWindow(
-      `SERVER FLAP: ${where} returned ${status} with an empty body — the game's own server, not a gate`,
+      `SERVER FLAP: ${where} returned ${status} with a message-less body (${visibleText(body).length} visible chars) — the game's own server, not a gate`,
       { where, status }
     );
   }
@@ -424,6 +465,8 @@ module.exports = {
   isHalted,
   supersedeObsoleteHalt,
   explainObsoleteHalt,
+  visibleText,
+  isServerErrorDocument,
   assertClear,
   inspect,
   trip,
