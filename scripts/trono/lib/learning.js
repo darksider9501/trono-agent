@@ -109,6 +109,11 @@ function apply(rows, hero) {
     // Keep the model's number under its own name before a measurement replaces it;
     // the trust gate below has to compare against the simulation, always.
     r.hpCostSimulated = r.hpCost;
+    // What the SIMULATOR said, before any demotion below. The probe escape hatch
+    // at the end of this function needs it: a target demoted for lack of evidence
+    // is still one the model thinks is winnable, and that is exactly the one
+    // worth measuring.
+    r.simWin = !!r.win;
     if (measured && e.hpCost) {
       r.hpCost = e.hpCost;
       r.goldPerHp = +(r.gold / Math.max(1, r.hpCost)).toFixed(4);

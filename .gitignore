@@ -19,6 +19,12 @@
 # Volatile or regenerable artifacts inside the tracked tree
 scripts/trono/logs/
 scripts/trono/state/
+# The seed of measured fight costs is NOT volatile: without it a cold cache
+# demotes every target (pool 330 requires sim cost <= 27 HP) and the agent
+# idles forever. Only this file is versioned; the live copy stays in the cache.
+!scripts/trono/state/
+scripts/trono/state/*
+!scripts/trono/state/learning.seed.json
 **/player_state_raw*.json
 **/driver.lock
 *.log

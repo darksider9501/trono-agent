@@ -1,0 +1,47 @@
+{
+  "morvak": {
+    "hpCost": 387,
+    "fights": 1,
+    "wins": 1,
+    "losses": 0,
+    "cooldownUntil": 0
+  },
+  "brumak": {
+    "hpCost": 39.5,
+    "fights": 199,
+    "wins": 196,
+    "losses": 0,
+    "cooldownUntil": 0,
+    "level": 9
+  },
+  "aeril": {
+    "hpCost": 45.6,
+    "fights": 5,
+    "wins": 5,
+    "losses": 0,
+    "cooldownUntil": 0
+  },
+  "virex": {
+    "hpCost": 12.4,
+    "fights": 9,
+    "wins": 8,
+    "losses": 0,
+    "cooldownUntil": 0
+  },
+  "eryndor": {
+    "hpCost": 358.5,
+    "fights": 25,
+    "wins": 21,
+    "losses": 0,
+    "cooldownUntil": 0,
+    "level": 9
+  },
+  "lyss": {
+    "hpCost": 141.1,
+    "fights": 6,
+    "wins": 6,
+    "losses": 0,
+    "cooldownUntil": 0,
+    "level": 7
+  }
+}
