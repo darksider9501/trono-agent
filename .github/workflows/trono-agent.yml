@@ -131,7 +131,7 @@ jobs:
       - name: Seed measured fight history when the cache is empty
         run: |
           if [ ! -s scripts/trono/state/learning.json ] || [ "$(tr -d '[:space:]' < scripts/trono/state/learning.json)" = "{}" ]; then
-            cp scripts/trono/state/learning.seed.json scripts/trono/state/learning.json
+            cp scripts/trono/lib/learning.seed.json scripts/trono/state/learning.json
             echo "learning.json sembrado desde learning.seed.json (cache vacio)"
           else
             echo "learning.json presente en el cache, no se toca"
